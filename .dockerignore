@@ -1,0 +1,6 @@
+.git
+.gitignore
+README.md
+sessions/
+blacklist.txt
+*.log 

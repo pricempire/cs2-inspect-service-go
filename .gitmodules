@@ -1,0 +1,3 @@
+[submodule "go-steam"]
+	path = go-steam
+	url = git@github.com:antal-k/go-steam.git
