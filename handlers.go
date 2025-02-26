@@ -42,7 +42,10 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Received inspect request for link: %s", inspectLink)
+	// Check if we should refresh the data from the Game Coordinator
+	refresh := r.URL.Query().Get("refresh") != ""
+	
+	log.Printf("Received inspect request for link: %s (refresh: %v)", inspectLink, refresh)
 
 	// Parse the inspect link
 	paramA, paramD, owner, err := parseInspectLink(inspectLink)
@@ -56,8 +59,8 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Parsed inspect link: A:%d D:%d Owner:%d", paramA, paramD, owner)
 	
-	// Check if we have a database connection
-	if db != nil {
+	// Check if we have a database connection and should use cached data
+	if db != nil && !refresh {
 		// Try to find the item in the database by asset parameters
 		assetID := int64(paramA)
 		dValue := strconv.FormatUint(paramD, 10)
@@ -81,7 +84,7 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 				PaintSeed:         uint32(asset.PaintSeed),
 				CustomName:        asset.CustomName,
 				KilleaterScoreType: uint32(asset.KilleaterScoreType),
-				KilleaterValue:    int32(asset.KilleaterValue),
+				KilleaterValue:    getKilleaterValue(asset.KilleaterValue),
 				Origin:            uint32(asset.Origin),
 				QuestId:           uint32(asset.QuestID),
 				DropReason:        uint32(asset.DropReason),
@@ -316,6 +319,16 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 			
 			// Create and save history record if we have a history type
 			if historyType != 0 {
+				// Ensure PrevAssetID is 0 if it's not set
+				if prevAssetID == 0 {
+					prevAssetID = 0
+				}
+				
+				// Ensure prevOwner is not empty
+				if prevOwner == "" {
+					prevOwner = "0"
+				}
+
 				history := &History{
 					UniqueID:      uniqueID,
 					AssetID:       asset.AssetID,
@@ -512,4 +525,12 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 		Success: true,
 		History: history,
 	})
+} 
+
+// getKilleaterValue returns the KilleaterValue if it's >= 0, otherwise returns -1
+func getKilleaterValue(value int32) int32 {
+	if value >= 0 {
+		return value
+	}
+	return 0
 }

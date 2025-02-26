@@ -309,7 +309,21 @@ func (h *CS2Handler) CheckGCConnection() bool {
 
 // Shutdown stops the hello ticker and cleans up resources
 func (h *CS2Handler) Shutdown() {
-	close(h.stopHelloTicker)
+	// Use a mutex to protect the channel close operation
+	h.readyMutex.Lock()
+	defer h.readyMutex.Unlock()
+	
+	// Create a non-blocking select to check if the channel is already closed
+	select {
+	case _, ok := <-h.stopHelloTicker:
+		if !ok {
+			// Channel is already closed, do nothing
+			return
+		}
+	default:
+		// Channel is still open, close it
+		close(h.stopHelloTicker)
+	}
 }
 
 // ExtractItemInfo extracts item information from a response packet
@@ -347,6 +361,8 @@ func ExtractItemInfo(responseData []byte) (*ItemInfo, error) {
 		EntIndex:          response.Iteminfo.GetEntindex(),
 		PetIndex:          response.Iteminfo.GetPetindex(),
 	} 
+
+	log.Println("ItemInfo: ", response.Iteminfo)
 	
 	// Determine if the item is Souvenir
 	// Origin 12 is tournament drops (Souvenir)

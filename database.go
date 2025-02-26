@@ -180,6 +180,15 @@ func SaveAsset(asset *Asset) error {
 	asset.CreatedAt = now
 	asset.UpdatedAt = now
 	
+	// Ensure stickers and keychains are valid JSON arrays if they're empty
+	if len(asset.Stickers) == 0 {
+		asset.Stickers = []byte("[]")
+	}
+	
+	if len(asset.Keychains) == 0 {
+		asset.Keychains = []byte("[]")
+	}
+	
 	query := `
 		INSERT INTO asset (
 			unique_id, asset_id, ms, d, paint_seed, paint_index, paint_wear, 
@@ -191,7 +200,7 @@ func SaveAsset(asset *Asset) error {
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 
 			$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
 		)
-		ON CONFLICT (asset_id, ms, d, stickers, keychains) DO UPDATE SET
+		ON CONFLICT (asset_id, ms, d, stickers) DO UPDATE SET
 			unique_id = EXCLUDED.unique_id,
 			paint_seed = EXCLUDED.paint_seed,
 			paint_index = EXCLUDED.paint_index,
@@ -309,6 +318,23 @@ func SaveHistory(history *History) error {
 	// Set timestamp
 	history.CreatedAt = time.Now()
 	
+	// Ensure JSON fields are valid JSON arrays if they're empty
+	if len(history.Stickers) == 0 {
+		history.Stickers = []byte("[]")
+	}
+	
+	if len(history.Keychains) == 0 {
+		history.Keychains = []byte("[]")
+	}
+	
+	if len(history.PrevStickers) == 0 {
+		history.PrevStickers = []byte("[]")
+	}
+	
+	if len(history.PrevKeychains) == 0 {
+		history.PrevKeychains = []byte("[]")
+	}
+	
 	query := `
 		INSERT INTO history (
 			unique_id, asset_id, prev_asset_id, owner, prev_owner, d,
@@ -320,7 +346,7 @@ func SaveHistory(history *History) error {
 		ON CONFLICT (unique_id, asset_id) DO NOTHING
 		RETURNING id
 	`
-	
+ 
 	return db.QueryRow(
 		query,
 		history.UniqueID, history.AssetID, history.PrevAssetID, history.Owner, 
