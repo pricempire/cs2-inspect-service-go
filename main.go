@@ -31,6 +31,16 @@ func main() {
 		port = "4000"
 	}
 
+	// Initialize database connection
+	log.Println("Initializing database connection...")
+	if err := InitDB(); err != nil {
+		log.Printf("Warning: Failed to initialize database: %v", err)
+		log.Println("Continuing without database support - caching will be disabled")
+	} else {
+		log.Println("Database connection established successfully")
+		defer CloseDB()
+	}
+
 	// Load accounts
 	accounts, err := loadAccounts()
 	if err != nil {
@@ -85,6 +95,7 @@ func main() {
 	http.HandleFunc("/inspect", handleInspect)
 	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/reconnect", handleReconnect)
+	http.HandleFunc("/history", handleHistory)
 	
 	// Start HTTP server
 	log.Printf("Starting HTTP server on port %s", port)

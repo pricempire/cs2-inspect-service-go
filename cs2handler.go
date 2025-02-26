@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"sync"
 	"time"
 
@@ -13,10 +14,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// Constants for GC connection
+// Constants for GC connection and special values
 const (
 	HelloInterval = 30 * time.Second
 	MaxHelloAttempts = 5
+	KilleaterNotSet = math.MaxUint32 // Special value to indicate Killeatervalue was nil
 )
 
 // ByteSlice is a wrapper for []byte that implements protocol.Serializer
@@ -180,10 +182,10 @@ func (h *CS2Handler) HandleItemInfoResponse(packet *gamecoordinator.GCPacket) {
 	
 	// Log the response details
 	if response.Iteminfo != nil {
-		log.Printf("Received item info: DefIndex=%d, PaintIndex=%d, PaintWear=%d, PaintSeed=%d",
+		log.Printf("Received item info: DefIndex=%d, PaintIndex=%d, PaintWear=%f, PaintSeed=%d",
 			response.Iteminfo.GetDefindex(), 
 			response.Iteminfo.GetPaintindex(),
-			response.Iteminfo.GetPaintwear(),
+			convertPaintWearToFloat(response.Iteminfo.GetPaintwear()),
 			response.Iteminfo.GetPaintseed())
 	} else {
 		log.Println("Response contains no item info")
@@ -325,27 +327,87 @@ func ExtractItemInfo(responseData []byte) (*ItemInfo, error) {
 	
 	// Create a new ItemInfo struct
 	itemInfo := &ItemInfo{
-		DefIndex:   response.Iteminfo.GetDefindex(),
-		PaintIndex: response.Iteminfo.GetPaintindex(),
-		Rarity:     response.Iteminfo.GetRarity(),
-		Quality:    response.Iteminfo.GetQuality(),
-		PaintWear:  response.Iteminfo.GetPaintwear(),
-		PaintSeed:  response.Iteminfo.GetPaintseed(),
-		CustomName: response.Iteminfo.GetCustomname(),
-	}
+		// Extract all fields from the response
+		AccountId:         response.Iteminfo.GetAccountid(),
+		ItemId:            response.Iteminfo.GetItemid(),
+		DefIndex:          response.Iteminfo.GetDefindex(),
+		PaintIndex:        response.Iteminfo.GetPaintindex(),
+		Rarity:            response.Iteminfo.GetRarity(),
+		Quality:           response.Iteminfo.GetQuality(),
+		PaintWear:         convertPaintWearToFloat(response.Iteminfo.GetPaintwear()),
+		PaintSeed:         response.Iteminfo.GetPaintseed(),
+		KilleaterScoreType: response.Iteminfo.GetKilleaterscoretype(),
+		KilleaterValue:    getKilleaterValueOrNegativeOne(response.Iteminfo),
+		CustomName:        response.Iteminfo.GetCustomname(),
+		Inventory:         response.Iteminfo.GetInventory(),
+		Origin:            response.Iteminfo.GetOrigin(),
+		QuestId:           response.Iteminfo.GetQuestid(),
+		DropReason:        response.Iteminfo.GetDropreason(),
+		MusicIndex:        response.Iteminfo.GetMusicindex(),
+		EntIndex:          response.Iteminfo.GetEntindex(),
+		PetIndex:          response.Iteminfo.GetPetindex(),
+	} 
+	
+	// Determine if the item is Souvenir
+	// Origin 12 is tournament drops (Souvenir)
+	itemInfo.IsSouvenir = itemInfo.Quality == 12 
+	
+	// Determine if the item is StatTrak based on KilleaterScoreType
+	// If KilleaterScoreType is set (greater than 0), the item has a StatTrak counter
+	itemInfo.IsStatTrak = itemInfo.KilleaterValue != -1 && itemInfo.Quality != 12
+	
 	
 	// Extract sticker information
 	if len(response.Iteminfo.GetStickers()) > 0 {
 		for _, sticker := range response.Iteminfo.GetStickers() {
 			stickerInfo := StickerInfo{
-				ID:       sticker.GetStickerId(),
-				Wear:     sticker.GetWear(),
-				Scale:    sticker.GetScale(),
-				Rotation: sticker.GetRotation(),
+				Slot:      sticker.GetSlot(),
+				ID:        sticker.GetStickerId(),
+				Wear:      sticker.GetWear(),
+				Scale:     sticker.GetScale(),
+				Rotation:  sticker.GetRotation(),
+				TintId:    sticker.GetTintId(),
+				OffsetX:   sticker.GetOffsetX(),
+				OffsetY:   sticker.GetOffsetY(),
+				OffsetZ:   sticker.GetOffsetZ(),
+				Pattern:   sticker.GetPattern(),
 			}
 			itemInfo.Stickers = append(itemInfo.Stickers, stickerInfo)
 		}
-	} 
+	}
 	
+	// Extract keychain information
+	if len(response.Iteminfo.GetKeychains()) > 0 {
+		for _, keychain := range response.Iteminfo.GetKeychains() {
+			keychainInfo := StickerInfo{
+				Slot:      keychain.GetSlot(),
+				ID:        keychain.GetStickerId(),
+				Wear:      keychain.GetWear(),
+				Scale:     keychain.GetScale(),
+				Rotation:  keychain.GetRotation(),
+				TintId:    keychain.GetTintId(),
+				OffsetX:   keychain.GetOffsetX(),
+				OffsetY:   keychain.GetOffsetY(),
+				OffsetZ:   keychain.GetOffsetZ(),
+				Pattern:   keychain.GetPattern(),
+			}
+			itemInfo.Keychains = append(itemInfo.Keychains, keychainInfo)
+		}
+	} 
 	return itemInfo, nil
+}
+
+// getKilleaterValueOrNegativeOne returns KilleaterNotSet if the Killeatervalue is nil, otherwise returns the actual value
+func getKilleaterValueOrNegativeOne(itemInfo *csgoProto.CEconItemPreviewDataBlock) int32 { 
+	if itemInfo != nil && itemInfo.Killeatervalue != nil {
+		return int32(*itemInfo.Killeatervalue)
+	} 
+	return -1
+}
+
+// convertPaintWearToFloat converts the uint32 paint wear value to a float64 between 0 and 1
+func convertPaintWearToFloat(paintWear uint32) float64 {
+	// For CS2, paint wear is stored as a IEEE 754 binary32 float
+	// We need to interpret the uint32 bits as a float32
+	return float64(math.Float32frombits(paintWear))
 } 

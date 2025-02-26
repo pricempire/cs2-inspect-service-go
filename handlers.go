@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -50,6 +55,69 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("Parsed inspect link: A:%d D:%d Owner:%d", paramA, paramD, owner)
+	
+	// Check if we have a database connection
+	if db != nil {
+		// Try to find the item in the database by asset parameters
+		assetID := int64(paramA)
+		dValue := strconv.FormatUint(paramD, 10)
+		msValue := int64(owner)
+		
+		log.Printf("Checking database for asset: AssetID=%d, D=%s, MS=%d", assetID, dValue, msValue)
+		
+		asset, err := FindAssetByParams(assetID, dValue, msValue)
+		if err != nil {
+			log.Printf("Error querying database: %v", err)
+		} else if asset != nil {
+			log.Printf("Found asset in database: %s", asset.UniqueID)
+			
+			// Create item info from the asset
+			itemInfo := &ItemInfo{
+				DefIndex:          uint32(asset.DefIndex),
+				PaintIndex:        uint32(asset.PaintIndex),
+				Rarity:            uint32(asset.Rarity),
+				Quality:           uint32(asset.Quality),
+				PaintWear:         asset.PaintWear,
+				PaintSeed:         uint32(asset.PaintSeed),
+				CustomName:        asset.CustomName,
+				KilleaterScoreType: uint32(asset.KilleaterScoreType),
+				KilleaterValue:    int32(asset.KilleaterValue),
+				Origin:            uint32(asset.Origin),
+				QuestId:           uint32(asset.QuestID),
+				DropReason:        uint32(asset.DropReason),
+				MusicIndex:        uint32(asset.MusicIndex),
+				EntIndex:          int32(asset.EntIndex),
+				PetIndex:          uint32(asset.PetIndex),
+				Inventory:         uint32(asset.Inventory),
+				IsStatTrak:        asset.IsStattrak,
+				IsSouvenir:        asset.IsSouvenir,
+			}
+			
+			// If we have stickers, unmarshal them
+			if asset.Stickers != nil && len(asset.Stickers) > 0 {
+				var stickers []StickerInfo
+				if err := json.Unmarshal(asset.Stickers, &stickers); err == nil {
+					itemInfo.Stickers = stickers
+				}
+			}
+			
+			// If we have keychains, unmarshal them
+			if asset.Keychains != nil && len(asset.Keychains) > 0 {
+				var keychains []StickerInfo
+				if err := json.Unmarshal(asset.Keychains, &keychains); err == nil {
+					itemInfo.Keychains = keychains
+				}
+			}
+			
+			// Return the cached response
+			sendJSONResponse(w, InspectResponse{
+				Success:  true,
+				ItemInfo: itemInfo,
+				Cached:   true,
+			})
+			return
+		}
+	}
 
 	// Get an available bot
 	bot := getAvailableBot()
@@ -121,10 +189,168 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		
+		// Save to database if we have a connection
+		if db != nil && itemInfo != nil {
+			// Generate a unique ID for the asset using item properties
+			uniqueID := generateUniqueID(itemInfo)
+			
+			// Convert stickers to JSON
+			var stickersJSON []byte
+			if len(itemInfo.Stickers) > 0 {
+				stickersJSON, _ = json.Marshal(itemInfo.Stickers)
+			}
+			
+			// Convert keychains to JSON
+			var keychainsJSON []byte
+			if len(itemInfo.Keychains) > 0 {
+				keychainsJSON, _ = json.Marshal(itemInfo.Keychains)
+			}
+			
+			// Check if we already have this asset with a different owner or stickers/keychains
+			existingAsset, err := FindAssetByUniqueID(uniqueID)
+			if err != nil {
+				log.Printf("Error checking for existing asset: %v", err)
+			}
+			
+			// Create asset record
+			asset := &Asset{
+				UniqueID:           uniqueID,
+				AssetID:            int64(paramA),
+				Ms:                 int64(owner),
+				D:                  strconv.FormatUint(paramD, 10),
+				PaintSeed:          int16(itemInfo.PaintSeed),
+				PaintIndex:         int16(itemInfo.PaintIndex),
+				PaintWear:          float64(itemInfo.PaintWear),
+				Quality:            int16(itemInfo.Quality),
+				CustomName:         itemInfo.CustomName,
+				DefIndex:           int16(itemInfo.DefIndex),
+				Rarity:             int16(itemInfo.Rarity),
+				Origin:             int16(itemInfo.Origin),
+				QuestID:            int16(itemInfo.QuestId),
+				Reason:             int16(itemInfo.DropReason),
+				MusicIndex:         int16(itemInfo.MusicIndex),
+				EntIndex:           int16(itemInfo.EntIndex),
+				PetIndex:           int16(itemInfo.PetIndex),
+				IsStattrak:         itemInfo.IsStatTrak,
+				IsSouvenir:         itemInfo.IsSouvenir,
+				Stickers:           stickersJSON,
+				Keychains:          keychainsJSON,
+				KilleaterScoreType: int16(itemInfo.KilleaterScoreType),
+				KilleaterValue:     int32(itemInfo.KilleaterValue),
+				Inventory:          int64(itemInfo.Inventory),
+				DropReason:         int16(itemInfo.DropReason),
+			}
+
+			// Create a history record
+			var historyType HistoryType
+			var prevAssetID int64
+			var prevOwner string
+			var prevStickers []byte
+			var prevKeychains []byte
+
+			if existingAsset != nil {
+				ownerChanged := existingAsset.Ms != asset.Ms
+				stickersChanged := !bytes.Equal(existingAsset.Stickers, asset.Stickers)
+				keychainsChanged := !bytes.Equal(existingAsset.Keychains, asset.Keychains)
+				nametagChanged := existingAsset.CustomName != asset.CustomName
+				
+				if ownerChanged || stickersChanged || keychainsChanged || nametagChanged {
+					// Determine history type
+					historyType = HistoryTypeUnknown
+					
+					if ownerChanged {
+						historyType = HistoryTypeTrade
+					} else if stickersChanged {
+						// Determine if stickers were added, removed, or changed
+						if len(existingAsset.Stickers) == 0 && len(asset.Stickers) > 0 {
+							historyType = HistoryTypeStickerApply
+						} else if len(existingAsset.Stickers) > 0 && len(asset.Stickers) == 0 {
+							historyType = HistoryTypeStickerRemove
+						} else {
+							historyType = HistoryTypeStickerChange
+						}
+					} else if keychainsChanged {
+						// Determine if keychains were added, removed, or changed
+						if len(existingAsset.Keychains) == 0 && len(asset.Keychains) > 0 {
+							historyType = HistoryTypeKeychainAdded
+						} else if len(existingAsset.Keychains) > 0 && len(asset.Keychains) == 0 {
+							historyType = HistoryTypeKeychainRemoved
+						} else {
+							historyType = HistoryTypeKeychainChanged
+						}
+					} else if nametagChanged {
+						if asset.CustomName == "" {
+							historyType = HistoryTypeNametagRemoved
+						} else {
+							historyType = HistoryTypeNametagAdded
+						}
+					}
+
+					prevAssetID = existingAsset.AssetID
+					prevOwner = strconv.FormatInt(existingAsset.Ms, 10)
+					prevStickers = existingAsset.Stickers
+					prevKeychains = existingAsset.Keychains
+				} else {
+					// No changes detected, don't create a history record
+					historyType = 0
+				}
+			} else {
+				// This is a new item, determine history type based on origin
+				switch asset.Origin {
+				case 8:
+					historyType = HistoryTypeTradedUp
+				case 4:
+					historyType = HistoryTypeDropped
+				case 1:
+					historyType = HistoryTypePurchasedIngame
+				case 2:
+					historyType = HistoryTypeUnboxed
+				case 3:
+					historyType = HistoryTypeCrafted
+				case 12:
+					historyType = HistoryTypeDropped // Tournament drops
+				default:
+					historyType = HistoryTypeUnknown
+				}
+			}
+			
+			// Create and save history record if we have a history type
+			if historyType != 0 {
+				history := &History{
+					UniqueID:      uniqueID,
+					AssetID:       asset.AssetID,
+					PrevAssetID:   prevAssetID,
+					Owner:         strconv.FormatInt(asset.Ms, 10),
+					PrevOwner:     prevOwner,
+					D:             asset.D,
+					Stickers:      asset.Stickers,
+					Keychains:     asset.Keychains,
+					PrevStickers:  prevStickers,
+					PrevKeychains: prevKeychains,
+					Type:          historyType,
+				}
+				
+				// Save history record
+				if err := SaveHistory(history); err != nil {
+					log.Printf("Error saving history record: %v", err)
+				} else {
+					log.Printf("Saved history record: %s (Type: %d)", uniqueID, historyType)
+				}
+			}
+			
+			// Save to database
+			if err := SaveAsset(asset); err != nil {
+				log.Printf("Error saving asset to database: %v", err)
+			} else {
+				log.Printf("Saved asset to database: %s", uniqueID)
+			}
+		}
+		
 		// Return the successful response with item info
 		sendJSONResponse(w, InspectResponse{
 			Success:  true,
 			ItemInfo: itemInfo,
+			Cached:   false,
 		})
 		
 	case <-timeoutChan:
@@ -134,6 +360,34 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 			Error:   fmt.Sprintf("Request timed out after %v", timeoutDuration),
 		})
 	}
+}
+
+// generateUniqueID creates a unique identifier for an item based on its properties
+func generateUniqueID(item *ItemInfo) string {
+	// Combine the relevant item properties
+	values := []interface{}{
+		item.PaintSeed,
+		item.PaintIndex,
+		item.PaintWear,
+		item.DefIndex,
+		item.Origin,
+		item.Rarity,
+		item.QuestId,
+		item.Quality,
+		item.DropReason,
+	}
+	
+	// Convert values to strings and join with hyphens
+	var stringValues []string
+	for _, v := range values {
+		stringValues = append(stringValues, fmt.Sprintf("%v", v))
+	}
+	stringToHash := strings.Join(stringValues, "-")
+	
+	// Create SHA1 hash and take first 8 characters
+	hash := sha1.New()
+	hash.Write([]byte(stringToHash))
+	return hex.EncodeToString(hash.Sum(nil))[:8]
 }
 
 // handleHealth handles the health check request
@@ -193,4 +447,69 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		Status: status,
 		Bots:   botStatuses,
 	})
-} 
+}
+
+// HistoryResponse represents the response for a history request
+type HistoryResponse struct {
+	Success  bool       `json:"success"`
+	History  []*History `json:"history,omitempty"`
+	Error    string     `json:"error,omitempty"`
+}
+
+// handleHistory handles the history request
+func handleHistory(w http.ResponseWriter, r *http.Request) {
+	// Set CORS headers
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	
+	// Handle OPTIONS request
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	
+	// Only allow GET requests
+	if r.Method != "GET" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get the unique ID from the query string
+	uniqueID := r.URL.Query().Get("uniqueId")
+	if uniqueID == "" {
+		sendJSONResponse(w, HistoryResponse{
+			Success: false,
+			Error:   "Missing uniqueId parameter",
+		})
+		return
+	}
+
+	log.Printf("Received history request for uniqueId: %s", uniqueID)
+
+	// Check if we have a database connection
+	if db == nil {
+		sendJSONResponse(w, HistoryResponse{
+			Success: false,
+			Error:   "Database connection not available",
+		})
+		return
+	}
+
+	// Find history records for the item
+	history, err := FindHistoryByUniqueID(uniqueID)
+	if err != nil {
+		log.Printf("Error querying history: %v", err)
+		sendJSONResponse(w, HistoryResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Error querying history: %v", err),
+		})
+		return
+	}
+
+	// Return the history records
+	sendJSONResponse(w, HistoryResponse{
+		Success: true,
+		History: history,
+	})
+}

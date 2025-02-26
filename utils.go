@@ -24,8 +24,8 @@ func parseInspectLink(link string) (paramA, paramD uint64, owner uint64, err err
 	return paramA, paramD, owner, nil
 }
 
-// sendJSONResponse sends a JSON response
-func sendJSONResponse(w http.ResponseWriter, response InspectResponse) {
+// sendJSONResponse sends a JSON response to the client
+func sendJSONResponse(w http.ResponseWriter, response interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
 } 
