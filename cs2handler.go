@@ -378,6 +378,9 @@ func ExtractItemInfo(responseData []byte) (*ItemInfo, error) {
 		MusicIndex:        response.Iteminfo.GetMusicindex(),
 		EntIndex:          response.Iteminfo.GetEntindex(),
 		PetIndex:          response.Iteminfo.GetPetindex(),
+		// Initialize stickers and keychains as empty arrays
+		Stickers:          []StickerInfo{},
+		Keychains:         []StickerInfo{},
 	} 
 
 	LogDebug("ItemInfo: %+v", response.Iteminfo)
@@ -406,6 +409,16 @@ func ExtractItemInfo(responseData []byte) (*ItemInfo, error) {
 				OffsetZ:   sticker.GetOffsetZ(),
 				Pattern:   sticker.GetPattern(),
 			}
+			
+			// Add sticker name from schema if available
+			s := GetSchema()
+			if s != nil {
+				stickerIDStr := fmt.Sprintf("%d", stickerInfo.ID)
+				if stickerData, ok := s.Stickers[stickerIDStr]; ok {
+					stickerInfo.Name = stickerData.MarketHashName
+				}
+			}
+			
 			itemInfo.Stickers = append(itemInfo.Stickers, stickerInfo)
 		}
 	}
@@ -425,6 +438,16 @@ func ExtractItemInfo(responseData []byte) (*ItemInfo, error) {
 				OffsetZ:   keychain.GetOffsetZ(),
 				Pattern:   keychain.GetPattern(),
 			}
+			
+			// Add keychain name from schema if available
+			s := GetSchema()
+			if s != nil {
+				keychainIDStr := fmt.Sprintf("%d", keychainInfo.ID)
+				if keychainData, ok := s.Keychains[keychainIDStr]; ok {
+					keychainInfo.Name = keychainData.MarketHashName
+				}
+			}
+			
 			itemInfo.Keychains = append(itemInfo.Keychains, keychainInfo)
 		}
 	}

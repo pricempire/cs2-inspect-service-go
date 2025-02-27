@@ -124,6 +124,8 @@ func LoadSchema() error {
 		return fmt.Errorf("failed to read schema response: %v", err)
 	}
 	
+	LogInfo("Received schema response with %d bytes", len(body))
+	
 	schemaLock.Lock()
 	defer schemaLock.Unlock()
 	
@@ -132,7 +134,21 @@ func LoadSchema() error {
 		return fmt.Errorf("failed to unmarshal schema: %v", err)
 	}
 	
-	log.Println("Schema loaded successfully")
+	// Log schema details
+	LogInfo("Schema loaded successfully with %d stickers, %d keychains, %d weapons", 
+		len(schema.Stickers), len(schema.Keychains), len(schema.Weapons))
+	
+	// Log a few sticker entries as examples
+	count := 0
+	for id, sticker := range schema.Stickers {
+		if count < 5 {
+			LogDebug("Sample sticker: ID=%s, Name=%s", id, sticker.MarketHashName)
+			count++
+		} else {
+			break
+		}
+	}
+	
 	return nil
 }
 
@@ -198,6 +214,15 @@ func loadJSONFile(path string) ([]byte, error) {
 func GetSchema() *Schema {
 	schemaLock.RLock()
 	defer schemaLock.RUnlock()
+	
+	// Debug log to check if schema is loaded
+	if schema == nil {
+		LogError("Schema is nil, make sure it's loaded properly")
+	} else {
+		LogDebug("Schema loaded with %d stickers, %d keychains, %d weapons", 
+			len(schema.Stickers), len(schema.Keychains), len(schema.Weapons))
+	}
+	
 	return schema
 }
 

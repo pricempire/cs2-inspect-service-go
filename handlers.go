@@ -103,6 +103,8 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 				Inventory:         uint32(asset.Inventory),
 				IsStatTrak:        asset.IsStattrak,
 				IsSouvenir:        asset.IsSouvenir,
+				Stickers:          []StickerInfo{},
+				Keychains:         []StickerInfo{},
 			}
 			
 			// If we have stickers, unmarshal them
@@ -454,7 +456,37 @@ func applySchemaToItemInfo(itemInfo *ItemInfo) {
 		)
 		
 		// Set pattern name if available
-		itemInfo.Pattern = GetPatternName(itemInfo.MarketHashName, int16(itemInfo.PaintSeed))
+		patternName := GetPatternName(itemInfo.MarketHashName, int16(itemInfo.PaintSeed))
+		if patternName != "" {
+			itemInfo.Pattern = patternName
+		} else {
+			// Ensure Pattern is an empty string, not null
+			itemInfo.Pattern = ""
+		}
+		
+		// Add sticker names from schema
+		for i := range itemInfo.Stickers {
+			stickerIDStr := fmt.Sprintf("%d", itemInfo.Stickers[i].ID)
+			LogDebug("Looking up sticker name for ID: %s", stickerIDStr)
+			if sticker, ok := s.Stickers[stickerIDStr]; ok {
+				itemInfo.Stickers[i].Name = sticker.MarketHashName
+				LogDebug("Found sticker name: %s", sticker.MarketHashName)
+			} else {
+				LogWarning("Sticker ID %s not found in schema", stickerIDStr)
+			}
+		}
+		
+		// Add keychain names from schema
+		for i := range itemInfo.Keychains {
+			keychainIDStr := fmt.Sprintf("%d", itemInfo.Keychains[i].ID)
+			LogDebug("Looking up keychain name for ID: %s", keychainIDStr)
+			if keychain, ok := s.Keychains[keychainIDStr]; ok {
+				itemInfo.Keychains[i].Name = keychain.MarketHashName
+				LogDebug("Found keychain name: %s", keychain.MarketHashName)
+			} else {
+				LogWarning("Keychain ID %s not found in schema", keychainIDStr)
+			}
+		}
 		
 		// Set item type
 		defIndexStr := fmt.Sprintf("%d", itemInfo.DefIndex)
@@ -474,9 +506,28 @@ func applySchemaToItemInfo(itemInfo *ItemInfo) {
 			}
 		}
 		
-		// Set additional fields for the response
-		itemInfo.Rank = 0 // This would need to be calculated or retrieved from somewhere
-		itemInfo.TotalCount = 0 // This would need to be calculated or retrieved from somewhere
+		// Get ranking information from database
+		if db != nil {
+			// Use the asset ID from the item info
+			assetID := int64(0)
+			if itemInfo.ItemId > 0 {
+				assetID = int64(itemInfo.ItemId)
+			}
+			
+			lowRank, highRank, totalCount, err := GetAssetRanking(assetID)
+			if err != nil {
+				LogError("Error getting asset ranking: %v", err)
+			} else {
+				// Use the low rank (best float) as the primary rank
+				itemInfo.Rank = lowRank
+				itemInfo.TotalCount = totalCount
+				LogInfo("Asset ranking: Low=%d, High=%d, Total=%d", lowRank, highRank, totalCount)
+			}
+		} else {
+			// Default values if we can't get rankings
+			itemInfo.Rank = 0
+			itemInfo.TotalCount = 0
+		}
 		
 		// Ensure these boolean fields are set
 		// (they should already be set from the item data, but just to be sure)

@@ -22,6 +22,7 @@ type StickerInfo struct {
 	OffsetY   float32 `json:"offset_y,omitempty"`
 	OffsetZ   float32 `json:"offset_z,omitempty"`
 	Pattern   uint32  `json:"pattern,omitempty"`
+	Name      string  `json:"name,omitempty"`
 }
 
 // ItemInfo represents detailed information about an item
@@ -37,7 +38,7 @@ type ItemInfo struct {
 	KilleaterScoreType uint32       `json:"killeater_score_type,omitempty"`
 	KilleaterValue    int32        `json:"killeater_value,omitempty"` // int32 so we can represent -1 as a special value
 	CustomName        string        `json:"custom_name,omitempty"`
-	Stickers          []StickerInfo `json:"stickers,omitempty"`
+	Stickers          []StickerInfo `json:"stickers"` // Always include, even if empty
 	Inventory         uint32        `json:"inventory,omitempty"`
 	Origin            uint32        `json:"origin,omitempty"`
 	QuestId           uint32        `json:"quest_id,omitempty"`
@@ -45,7 +46,7 @@ type ItemInfo struct {
 	MusicIndex        uint32        `json:"music_index,omitempty"`
 	EntIndex          int32         `json:"ent_index,omitempty"`
 	PetIndex          uint32        `json:"pet_index,omitempty"`
-	Keychains         []StickerInfo `json:"keychains,omitempty"`
+	Keychains         []StickerInfo `json:"keychains"` // Always include, even if empty
 	IsSouvenir        bool          `json:"souvenir"`
 	IsStatTrak        bool          `json:"stattrak"`
 	

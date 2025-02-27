@@ -415,4 +415,36 @@ func FindHistoryByUniqueID(uniqueID string) ([]*History, error) {
 	}
 	
 	return histories, nil
+}
+
+// GetAssetRanking retrieves the ranking information for an asset
+func GetAssetRanking(assetID int64) (lowRank, highRank, totalCount int, err error) {
+	if db == nil {
+		return 0, 0, 0, fmt.Errorf("database connection not available")
+	}
+
+	// Query the rankings view for this asset
+	var rank struct {
+		LowRank    int
+		HighRank   int
+		TotalCount int
+	}
+
+	// First get the specific asset ranking
+	err = db.QueryRow(`
+		SELECT r.low_rank, r.high_rank, 
+		(SELECT COUNT(*) FROM asset WHERE paint_wear IS NOT NULL AND paint_wear > 0) as total_count
+		FROM rankings r
+		WHERE r.asset_id = $1
+	`, assetID).Scan(&rank.LowRank, &rank.HighRank, &rank.TotalCount)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			// If no ranking found, return zeros but no error
+			return 0, 0, 0, nil
+		}
+		return 0, 0, 0, err
+	}
+
+	return rank.LowRank, rank.HighRank, rank.TotalCount, nil
 } 
