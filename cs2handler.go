@@ -370,7 +370,7 @@ func ExtractItemInfo(responseData []byte) (*ItemInfo, error) {
 	
 	// Determine if the item is StatTrak based on KilleaterScoreType
 	// If KilleaterScoreType is set (greater than 0), the item has a StatTrak counter
-	itemInfo.IsStatTrak = itemInfo.KilleaterValue != -1 && itemInfo.Quality != 12
+	itemInfo.IsStatTrak = itemInfo.KilleaterScoreType > 0 && itemInfo.Quality != 12
 	
 	
 	// Extract sticker information
@@ -409,7 +409,59 @@ func ExtractItemInfo(responseData []byte) (*ItemInfo, error) {
 			}
 			itemInfo.Keychains = append(itemInfo.Keychains, keychainInfo)
 		}
-	} 
+	}
+	
+	// Add additional fields from schema
+	s := GetSchema()
+	if s != nil {
+		// Set wear name
+		itemInfo.WearName = GetWearName(itemInfo.PaintWear)
+		
+		// Set phase name for Doppler knives
+		itemInfo.Phase = GetPhaseName(int16(itemInfo.PaintIndex))
+		
+		// Build market hash name
+		itemInfo.MarketHashName = BuildMarketHashName(
+			int16(itemInfo.DefIndex),
+			int16(itemInfo.PaintIndex),
+			int16(itemInfo.Quality),
+			itemInfo.IsStatTrak,
+			itemInfo.IsSouvenir,
+			itemInfo.PaintWear,
+		)
+		
+		// Set pattern name if available
+		itemInfo.Pattern = GetPatternName(itemInfo.MarketHashName, int16(itemInfo.PaintSeed))
+		
+		// Set item type
+		defIndexStr := fmt.Sprintf("%d", itemInfo.DefIndex)
+		if _, ok := s.Weapons[defIndexStr]; ok {
+			itemInfo.Type = "Weapon"
+			
+			// Set min/max wear values if available
+			if itemInfo.PaintIndex > 0 {
+				paintIndexStr := fmt.Sprintf("%d", itemInfo.PaintIndex)
+				if weapon, ok := s.Weapons[defIndexStr]; ok {
+					if paint, ok := weapon.Paints[paintIndexStr]; ok {
+						itemInfo.Min = paint.Min
+						itemInfo.Max = paint.Max
+						itemInfo.Image = paint.Image
+					}
+				}
+			}
+		} else if defIndexStr == "1209" {
+			itemInfo.Type = "Sticker"
+		} else if defIndexStr == "1349" || defIndexStr == "1348" {
+			itemInfo.Type = "Graffiti"
+		} else if defIndexStr == "1355" {
+			itemInfo.Type = "Keychain"
+		} else if _, ok := s.Agents[defIndexStr]; ok {
+			itemInfo.Type = "Agent"
+		} else {
+			itemInfo.Type = "Unknown"
+		}
+	}
+	
 	return itemInfo, nil
 }
 

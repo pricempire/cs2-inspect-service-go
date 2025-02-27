@@ -51,6 +51,18 @@ type ItemInfo struct {
 	Keychains         []StickerInfo `json:"keychains,omitempty"`
 	IsSouvenir        bool          `json:"is_souvenir,omitempty"`
 	IsStatTrak        bool          `json:"is_stattrak,omitempty"`
+	
+	// Additional fields from format service
+	MarketHashName    string        `json:"market_hash_name,omitempty"`
+	WearName          string        `json:"wear_name,omitempty"`
+	Phase             string        `json:"phase,omitempty"`
+	Pattern           string        `json:"pattern,omitempty"`
+	Image             string        `json:"image,omitempty"`
+	Min               float64       `json:"min,omitempty"`
+	Max               float64       `json:"max,omitempty"`
+	Rank              int           `json:"rank,omitempty"`
+	TotalCount        int           `json:"total_count,omitempty"`
+	Type              string        `json:"type,omitempty"`
 }
 
 // InspectResponse represents the response from the inspect request

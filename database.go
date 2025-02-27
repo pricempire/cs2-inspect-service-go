@@ -335,6 +335,26 @@ func SaveHistory(history *History) error {
 		history.PrevKeychains = []byte("[]")
 	}
 	
+	// First check if a record with this unique_id and asset_id already exists
+	checkQuery := `
+		SELECT id FROM history 
+		WHERE unique_id = $1 AND asset_id = $2
+		LIMIT 1
+	`
+	
+	var existingId int64
+	err := db.QueryRow(checkQuery, history.UniqueID, history.AssetID).Scan(&existingId)
+	if err == nil {
+		// Record already exists, just return the existing ID
+		history.ID = existingId
+		log.Printf("History record already exists with ID %d", existingId)
+		return nil
+	} else if err != sql.ErrNoRows {
+		// An actual error occurred
+		return fmt.Errorf("error checking for existing history: %v", err)
+	}
+	
+	// No existing record, proceed with insert
 	query := `
 		INSERT INTO history (
 			unique_id, asset_id, prev_asset_id, owner, prev_owner, d,
@@ -343,10 +363,11 @@ func SaveHistory(history *History) error {
 		) VALUES (
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
 		)
-		ON CONFLICT (unique_id, asset_id) DO NOTHING
 		RETURNING id
 	`
- 
+
+	log.Println("Saving history: ", history.UniqueID, history.AssetID, history.PrevAssetID, history.Owner, history.PrevOwner, history.D, history.Stickers, history.Keychains, history.PrevStickers, history.PrevKeychains, history.Type, history.CreatedAt)
+	
 	return db.QueryRow(
 		query,
 		history.UniqueID, history.AssetID, history.PrevAssetID, history.Owner, 

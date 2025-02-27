@@ -112,6 +112,9 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			
+			// Apply schema information to cached items
+			applySchemaToItemInfo(itemInfo)
+			
 			// Return the cached response
 			sendJSONResponse(w, InspectResponse{
 				Success:  true,
@@ -398,9 +401,53 @@ func generateUniqueID(item *ItemInfo) string {
 	stringToHash := strings.Join(stringValues, "-")
 	
 	// Create SHA1 hash and take first 8 characters
-	hash := sha1.New()
-	hash.Write([]byte(stringToHash))
-	return hex.EncodeToString(hash.Sum(nil))[:8]
+	h := sha1.New()
+	h.Write([]byte(stringToHash))
+	return hex.EncodeToString(h.Sum(nil))[:8]
+}
+
+// applySchemaToItemInfo applies schema information to an ItemInfo object
+func applySchemaToItemInfo(itemInfo *ItemInfo) {
+	// Add additional fields from schema
+	s := GetSchema()
+	if s != nil {
+		// Set wear name
+		itemInfo.WearName = GetWearName(itemInfo.PaintWear)
+		
+		// Set phase name for Doppler knives
+		itemInfo.Phase = GetPhaseName(int16(itemInfo.PaintIndex))
+		
+		// Build market hash name
+		itemInfo.MarketHashName = BuildMarketHashName(
+			int16(itemInfo.DefIndex),
+			int16(itemInfo.PaintIndex),
+			int16(itemInfo.Quality),
+			itemInfo.IsStatTrak,
+			itemInfo.IsSouvenir,
+			itemInfo.PaintWear,
+		)
+		
+		// Set pattern name if available
+		itemInfo.Pattern = GetPatternName(itemInfo.MarketHashName, int16(itemInfo.PaintSeed))
+		
+		// Set item type
+		defIndexStr := fmt.Sprintf("%d", itemInfo.DefIndex)
+		if _, ok := s.Weapons[defIndexStr]; ok {
+			itemInfo.Type = "Weapon"
+			
+			// Set min/max wear values if available
+			if itemInfo.PaintIndex > 0 {
+				paintIndexStr := fmt.Sprintf("%d", itemInfo.PaintIndex)
+				if weapon, ok := s.Weapons[defIndexStr]; ok {
+					if paint, ok := weapon.Paints[paintIndexStr]; ok {
+						itemInfo.Min = paint.Min
+						itemInfo.Max = paint.Max
+						itemInfo.Image = paint.Image
+					}
+				}
+			}
+		}
+	}
 }
 
 // handleHealth handles the health check request

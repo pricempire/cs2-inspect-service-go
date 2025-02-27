@@ -40,6 +40,11 @@ func main() {
 		log.Println("Database connection established successfully")
 		defer CloseDB()
 	}
+	
+	// Initialize schema service
+	log.Println("Initializing schema service...")
+	StartSchemaUpdater()
+	log.Println("Schema service initialized")
 
 	// Load accounts
 	accounts, err := loadAccounts()
