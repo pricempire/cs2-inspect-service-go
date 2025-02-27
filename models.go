@@ -1,10 +1,7 @@
 package main
 
 import (
-	"sync"
 	"time"
-
-	goSteam "github.com/Philipp15b/go-steam/v3"
 )
 
 // Constants for CS2 Game Coordinator messages
@@ -31,12 +28,12 @@ type StickerInfo struct {
 type ItemInfo struct {
 	AccountId         uint32        `json:"account_id,omitempty"`
 	ItemId            uint64        `json:"item_id,omitempty"`
-	DefIndex          uint32        `json:"def_index"`
-	PaintIndex        uint32        `json:"paint_index"`
+	DefIndex          uint32        `json:"defindex"`
+	PaintIndex        uint32        `json:"paintindex"`
 	Rarity            uint32        `json:"rarity"`
 	Quality           uint32        `json:"quality"`
-	PaintWear         float64       `json:"paint_wear"`
-	PaintSeed         uint32        `json:"paint_seed"`
+	PaintWear         float64       `json:"floatvalue"`
+	PaintSeed         uint32        `json:"paintseed"`
 	KilleaterScoreType uint32       `json:"killeater_score_type,omitempty"`
 	KilleaterValue    int32        `json:"killeater_value,omitempty"` // int32 so we can represent -1 as a special value
 	CustomName        string        `json:"custom_name,omitempty"`
@@ -49,19 +46,19 @@ type ItemInfo struct {
 	EntIndex          int32         `json:"ent_index,omitempty"`
 	PetIndex          uint32        `json:"pet_index,omitempty"`
 	Keychains         []StickerInfo `json:"keychains,omitempty"`
-	IsSouvenir        bool          `json:"is_souvenir,omitempty"`
-	IsStatTrak        bool          `json:"is_stattrak,omitempty"`
+	IsSouvenir        bool          `json:"souvenir"`
+	IsStatTrak        bool          `json:"stattrak"`
 	
 	// Additional fields from format service
 	MarketHashName    string        `json:"market_hash_name,omitempty"`
 	WearName          string        `json:"wear_name,omitempty"`
 	Phase             string        `json:"phase,omitempty"`
-	Pattern           string        `json:"pattern,omitempty"`
+	Pattern           string        `json:"pattern"`
 	Image             string        `json:"image,omitempty"`
-	Min               float64       `json:"min,omitempty"`
-	Max               float64       `json:"max,omitempty"`
-	Rank              int           `json:"rank,omitempty"`
-	TotalCount        int           `json:"total_count,omitempty"`
+	Min               float64       `json:"min"`
+	Max               float64       `json:"max"`
+	Rank              int           `json:"rank"`
+	TotalCount        int           `json:"total_count"`
 	Type              string        `json:"type,omitempty"`
 }
 
@@ -70,7 +67,7 @@ type InspectResponse struct {
 	Success  bool      `json:"success"`
 	Data     []byte    `json:"data,omitempty"`
 	Error    string    `json:"error,omitempty"`
-	ItemInfo *ItemInfo `json:"itemInfo,omitempty"`
+	ItemInfo *ItemInfo `json:"iteminfo,omitempty"`
 	Cached   bool      `json:"cached,omitempty"`
 }
 
@@ -95,22 +92,4 @@ type Account struct {
 	Password string
 	SentryHash string
 	SharedSecret string
-}
-
-// Bot represents a Steam bot
-type Bot struct {
-	Account     Account
-	Client      *goSteam.Client
-	CS2Handler  *CS2Handler
-	Connected   bool
-	LoggedOn    bool
-	Busy        bool
-	LastUsed    time.Time
-	Mutex       sync.Mutex
-}
-
-// Global variables
-var (
-	bots     []*Bot
-	botMutex sync.Mutex
-) 
+} 

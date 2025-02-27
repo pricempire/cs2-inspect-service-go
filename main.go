@@ -1,12 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
-	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -18,12 +15,15 @@ type ReconnectResponse struct {
 }
 
 func main() {
-	log.Println("Starting CS:GO Skin Inspect Service")
-	
 	// Load environment variables from .env file
 	if err := godotenv.Load(); err != nil {
-		log.Printf("Warning: Error loading .env file: %v", err)
+		LogWarning("Error loading .env file: %v", err)
 	}
+	
+	// Initialize the logger
+	InitLogger()
+	
+	LogInfo("Starting CS:GO Skin Inspect Service")
 	
 	// Get port from environment or use default
 	port := os.Getenv("PORT")
@@ -32,69 +32,30 @@ func main() {
 	}
 
 	// Initialize database connection
-	log.Println("Initializing database connection...")
+	LogInfo("Initializing database connection...")
 	if err := InitDB(); err != nil {
-		log.Printf("Warning: Failed to initialize database: %v", err)
-		log.Println("Continuing without database support - caching will be disabled")
+		LogWarning("Failed to initialize database: %v", err)
+		LogInfo("Continuing without database support - caching will be disabled")
 	} else {
-		log.Println("Database connection established successfully")
+		LogInfo("Database connection established successfully")
 		defer CloseDB()
 	}
 	
 	// Initialize schema service
-	log.Println("Initializing schema service...")
+	LogInfo("Initializing schema service...")
 	StartSchemaUpdater()
-	log.Println("Schema service initialized")
-
-	// Load accounts
-	accounts, err := loadAccounts()
-	if err != nil {
-		log.Fatalf("Failed to load accounts: %v", err)
-	}
-	log.Printf("Loaded %d accounts", len(accounts))
+	LogInfo("Schema service initialized")
 
 	// Initialize bots
-	initializeBots(accounts)
-	log.Printf("Initialized %d bots", len(bots))
-
-	// Set up a ticker to periodically check if bots are connected to GC
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		
-		for {
-			select {
-			case <-ticker.C:
-				botMutex.Lock()
-				readyCount := 0
-				disconnectedCount := 0
-				
-				for _, bot := range bots {
-					bot.Mutex.Lock()
-					
-					// Check if the bot is connected and logged on
-					if bot.Connected && bot.LoggedOn {
-						// Check GC connection status
-						isReady := bot.CS2Handler.CheckGCConnection()
-						if isReady {
-							readyCount++
-						}
-					} else {
-						disconnectedCount++
-						log.Printf("Bot %s: Status - Connected: %v, LoggedOn: %v", 
-							bot.Account.Username, bot.Connected, bot.LoggedOn)
-					}
-					
-					bot.Mutex.Unlock()
-				}
-				
-				log.Printf("Bot status check: %d/%d bots ready, %d disconnected", 
-					readyCount, len(bots), disconnectedCount)
-				
-				botMutex.Unlock()
-			}
-		}
-	}()
+	LogInfo("Initializing bot manager...")
+	if err := InitializeBots(); err != nil {
+		LogError("Failed to initialize bots: %v", err)
+		os.Exit(1)
+	}
+	LogInfo("Bot manager initialized successfully")
+	
+	// Register shutdown handler
+	defer ShutdownBots()
 
 	// Set up HTTP server
 	http.HandleFunc("/inspect", handleInspect)
@@ -103,9 +64,10 @@ func main() {
 	http.HandleFunc("/history", handleHistory)
 	
 	// Start HTTP server
-	log.Printf("Starting HTTP server on port %s", port)
+	LogInfo("Starting HTTP server on port %s", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		log.Fatalf("Failed to start HTTP server: %v", err)
+		LogError("Failed to start HTTP server: %v", err)
+		os.Exit(1)
 	}
 }
 
@@ -131,48 +93,51 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 	// Get the username from the query string (optional)
 	username := r.URL.Query().Get("username")
 	
-	botMutex.Lock()
+	// If botManager is nil, return an error
+	if botManager == nil {
+		sendJSONResponse(w, ReconnectResponse{
+			Success: false,
+			Message: "Bot manager not initialized",
+		})
+		return
+	}
+	
 	reconnectedCount := 0
+	
+	botManager.mutex.RLock()
+	defer botManager.mutex.RUnlock()
 	
 	// If a username is provided, only reconnect that bot
 	if username != "" {
-		for _, bot := range bots {
-			bot.Mutex.Lock()
-			if bot.Account.Username == username {
-				if !bot.Connected || !bot.LoggedOn {
-					bot.Mutex.Unlock()
-					go reconnectBot(bot)
-					reconnectedCount++
-					log.Printf("Manual reconnect triggered for bot: %s", username)
-				} else {
-					bot.Mutex.Unlock()
-					log.Printf("Bot %s is already connected, no reconnect needed", username)
-				}
+		for _, bot := range botManager.bots {
+			bot.mutex.Lock()
+			if bot.account.Username == username {
+				botUsername := bot.account.Username
+				bot.mutex.Unlock()
+				
+				LogInfo("Manual reconnect triggered for bot: %s", botUsername)
+				bot.Reconnect()
+				reconnectedCount++
 				break
 			} else {
-				bot.Mutex.Unlock()
+				bot.mutex.Unlock()
 			}
 		}
 	} else {
-		// Otherwise, reconnect all disconnected bots
-		for _, bot := range bots {
-			bot.Mutex.Lock()
-			if !bot.Connected || !bot.LoggedOn {
-				botUsername := bot.Account.Username
-				bot.Mutex.Unlock()
-				go reconnectBot(bot)
-				reconnectedCount++
-				log.Printf("Manual reconnect triggered for bot: %s", botUsername)
-			} else {
-				bot.Mutex.Unlock()
-			}
+		// Otherwise, reconnect all bots
+		for _, bot := range botManager.bots {
+			bot.mutex.Lock()
+			botUsername := bot.account.Username
+			bot.mutex.Unlock()
+			
+			LogInfo("Manual reconnect triggered for bot: %s", botUsername)
+			bot.Reconnect()
+			reconnectedCount++
 		}
 	}
-	botMutex.Unlock()
 	
 	// Send response
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(ReconnectResponse{
+	sendJSONResponse(w, ReconnectResponse{
 		Success: true,
 		Message: fmt.Sprintf("Reconnect triggered for %d bots", reconnectedCount),
 	})

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/sha1"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -45,11 +46,12 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 	// Check if we should refresh the data from the Game Coordinator
 	refresh := r.URL.Query().Get("refresh") != ""
 	
-	log.Printf("Received inspect request for link: %s (refresh: %v)", inspectLink, refresh)
+	LogInfo("Received inspect request for link: %s (refresh: %v)", inspectLink, refresh)
 
 	// Parse the inspect link
-	paramA, paramD, owner, err := parseInspectLink(inspectLink)
+	paramA, paramD, paramS, paramM, err := parseInspectLink(inspectLink)
 	if err != nil {
+		LogError("Invalid inspect link: %v", err)
 		sendJSONResponse(w, InspectResponse{
 			Success: false,
 			Error:   fmt.Sprintf("Invalid inspect link: %v", err),
@@ -57,22 +59,29 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Parsed inspect link: A:%d D:%d Owner:%d", paramA, paramD, owner)
+	LogInfo("Parsed inspect link: A:%d D:%d S:%d M:%d", paramA, paramD, paramS, paramM)
 	
 	// Check if we have a database connection and should use cached data
 	if db != nil && !refresh {
 		// Try to find the item in the database by asset parameters
 		assetID := int64(paramA)
 		dValue := strconv.FormatUint(paramD, 10)
-		msValue := int64(owner)
 		
-		log.Printf("Checking database for asset: AssetID=%d, D=%s, MS=%d", assetID, dValue, msValue)
+		// Use either paramS or paramM as the owner value
+		var msValue int64
+		if paramS > 0 {
+			msValue = int64(paramS)
+		} else {
+			msValue = int64(paramM)
+		}
+		
+		LogInfo("Checking database for asset: AssetID=%d, D=%s, MS=%d", assetID, dValue, msValue)
 		
 		asset, err := FindAssetByParams(assetID, dValue, msValue)
 		if err != nil {
-			log.Printf("Error querying database: %v", err)
+			LogError("Error querying database: %v", err)
 		} else if asset != nil {
-			log.Printf("Found asset in database: %s", asset.UniqueID)
+			LogInfo("Found asset in database: %s", asset.UniqueID)
 			
 			// Create item info from the asset
 			itemInfo := &ItemInfo{
@@ -82,7 +91,7 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 				Quality:           uint32(asset.Quality),
 				PaintWear:         asset.PaintWear,
 				PaintSeed:         uint32(asset.PaintSeed),
-				CustomName:        asset.CustomName,
+				CustomName:        asset.CustomName.String,
 				KilleaterScoreType: uint32(asset.KilleaterScoreType),
 				KilleaterValue:    getKilleaterValue(asset.KilleaterValue),
 				Origin:            uint32(asset.Origin),
@@ -126,24 +135,25 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get an available bot
-	bot := getAvailableBot()
+	bot := GetAvailableBot()
 	if bot == nil {
+		LogError("No bots available")
 		sendJSONResponse(w, InspectResponse{
 			Success: false,
 			Error:   "No bots available",
 		})
 		return
 	}
-	defer releaseBot(bot)
+	defer ReleaseBot(bot)
 
-	log.Printf("Using bot: %s", bot.Account.Username)
+	LogInfo("Using bot: %s", bot.account.Username)
 
 	// Check if the bot is ready
-	if !bot.CS2Handler.IsReady() {
-		log.Printf("Bot %s is not ready, sending hello message", bot.Account.Username)
+	if !bot.isGCReady() {
+		LogInfo("Bot %s is not ready, sending hello message", bot.account.Username)
 		
 		// Send a hello message as a last resort
-		bot.CS2Handler.SendHello()
+		bot.SendHello()
 		
 		// Wait for the bot to become ready with a short timeout
 		readyTimeout := time.After(5 * time.Second)
@@ -154,13 +164,14 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 		for !ready {
 			select {
 			case <-readyTimeout:
+				LogError("Bot failed to connect to Game Coordinator")
 				sendJSONResponse(w, InspectResponse{
 					Success: false,
 					Error:   "Bot failed to connect to Game Coordinator",
 				})
 				return
 			case <-readyCheckTicker.C:
-				if bot.CS2Handler.IsReady() {
+				if bot.isGCReady() {
 					ready = true
 				}
 			}
@@ -168,24 +179,24 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Request item info
-	bot.CS2Handler.RequestItemInfo(paramA, paramD, owner)
+	bot.RequestItemInfo(paramA, paramD, paramS, paramM)
 
 	// Wait for response with timeout
 	timeoutDuration := ClientRequestTimeout
-	log.Printf("Waiting for response with timeout of %v", timeoutDuration)
+	LogInfo("Waiting for response with timeout of %v", timeoutDuration)
 	
 	// Create a timeout channel
 	timeoutChan := time.After(timeoutDuration)
 	
 	// Wait for either a response or a timeout
 	select {
-	case responseData := <-bot.CS2Handler.responseChannel:
-		log.Printf("Received response with %d bytes", len(responseData))
+	case responseData := <-bot.cs2Handler.responseChannel:
+		LogInfo("Received response with %d bytes", len(responseData))
 		
 		// Extract item info from the response
 		itemInfo, err := ExtractItemInfo(responseData)
 		if err != nil {
-			log.Printf("Error extracting item info: %v", err)
+			LogError("Error extracting item info: %v", err)
 			// Still return the raw data even if we couldn't extract the item info
 			sendJSONResponse(w, InspectResponse{
 				Success: true,
@@ -215,20 +226,28 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 			// Check if we already have this asset with a different owner or stickers/keychains
 			existingAsset, err := FindAssetByUniqueID(uniqueID)
 			if err != nil {
-				log.Printf("Error checking for existing asset: %v", err)
+				LogError("Error checking for existing asset: %v", err)
 			}
 			
 			// Create asset record
+			// Use either paramS or paramM as the owner value
+			var msValue int64
+			if paramS > 0 {
+				msValue = int64(paramS)
+			} else {
+				msValue = int64(paramM)
+			}
+			
 			asset := &Asset{
 				UniqueID:           uniqueID,
 				AssetID:            int64(paramA),
-				Ms:                 int64(owner),
+				Ms:                 msValue,
 				D:                  strconv.FormatUint(paramD, 10),
 				PaintSeed:          int16(itemInfo.PaintSeed),
 				PaintIndex:         int16(itemInfo.PaintIndex),
 				PaintWear:          float64(itemInfo.PaintWear),
 				Quality:            int16(itemInfo.Quality),
-				CustomName:         itemInfo.CustomName,
+				CustomName:         sql.NullString{String: itemInfo.CustomName, Valid: itemInfo.CustomName != ""},
 				DefIndex:           int16(itemInfo.DefIndex),
 				Rarity:             int16(itemInfo.Rarity),
 				Origin:             int16(itemInfo.Origin),
@@ -258,7 +277,7 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 				ownerChanged := existingAsset.Ms != asset.Ms
 				stickersChanged := !bytes.Equal(existingAsset.Stickers, asset.Stickers)
 				keychainsChanged := !bytes.Equal(existingAsset.Keychains, asset.Keychains)
-				nametagChanged := existingAsset.CustomName != asset.CustomName
+				nametagChanged := existingAsset.CustomName.String != asset.CustomName.String
 				
 				if ownerChanged || stickersChanged || keychainsChanged || nametagChanged {
 					// Determine history type
@@ -285,7 +304,7 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 							historyType = HistoryTypeKeychainChanged
 						}
 					} else if nametagChanged {
-						if asset.CustomName == "" {
+						if !asset.CustomName.Valid || asset.CustomName.String == "" {
 							historyType = HistoryTypeNametagRemoved
 						} else {
 							historyType = HistoryTypeNametagAdded
@@ -348,17 +367,17 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 				
 				// Save history record
 				if err := SaveHistory(history); err != nil {
-					log.Printf("Error saving history record: %v", err)
+					LogError("Error saving history record: %v", err)
 				} else {
-					log.Printf("Saved history record: %s (Type: %d)", uniqueID, historyType)
+					LogInfo("Saved history record: %s (Type: %d)", uniqueID, historyType)
 				}
 			}
 			
 			// Save to database
 			if err := SaveAsset(asset); err != nil {
-				log.Printf("Error saving asset to database: %v", err)
+				LogError("Error saving asset to database: %v", err)
 			} else {
-				log.Printf("Saved asset to database: %s", uniqueID)
+				LogInfo("Saved asset to database: %s", uniqueID)
 			}
 		}
 		
@@ -370,7 +389,14 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 		})
 		
 	case <-timeoutChan:
-		log.Printf("Request timed out after %v", timeoutDuration)
+		LogError("Request timed out after %v", timeoutDuration)
+		
+		// Send goodbye message to GC and reinitialize the bot
+		LogInfo("Sending goodbye message and reinitializing bot due to timeout")
+		
+		// Force a reconnect of the bot
+		bot.Reconnect()
+		
 		sendJSONResponse(w, InspectResponse{
 			Success: false,
 			Error:   fmt.Sprintf("Request timed out after %v", timeoutDuration),
@@ -447,6 +473,20 @@ func applySchemaToItemInfo(itemInfo *ItemInfo) {
 				}
 			}
 		}
+		
+		// Set additional fields for the response
+		itemInfo.Rank = 0 // This would need to be calculated or retrieved from somewhere
+		itemInfo.TotalCount = 0 // This would need to be calculated or retrieved from somewhere
+		
+		// Ensure these boolean fields are set
+		// (they should already be set from the item data, but just to be sure)
+		if itemInfo.IsStatTrak {
+			itemInfo.IsStatTrak = true
+		}
+		
+		if itemInfo.IsSouvenir {
+			itemInfo.IsSouvenir = true
+		}
 	}
 }
 
@@ -470,20 +510,29 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get the status of all bots
-	botMutex.Lock()
-	botStatuses := make([]BotStatus, 0, len(bots))
+	if botManager == nil {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(HealthResponse{
+			Status: "unhealthy",
+			Bots:   []BotStatus{},
+		})
+		return
+	}
+
+	botManager.mutex.RLock()
+	botStatuses := make([]BotStatus, 0, len(botManager.bots))
 	
 	readyCount := 0
-	for _, bot := range bots {
-		bot.Mutex.Lock()
+	for _, bot := range botManager.bots {
+		bot.mutex.Lock()
 		status := BotStatus{
-			Username:  bot.Account.Username,
-			Connected: bot.Connected,
-			LoggedOn:  bot.LoggedOn,
-			Ready:     bot.CS2Handler.IsReady(),
-			Busy:      bot.Busy,
+			Username:  bot.account.Username,
+			Connected: bot.state == BotStateConnected || bot.state == BotStateLoggedIn || bot.state == BotStateReady || bot.state == BotStateBusy,
+			LoggedOn:  bot.state == BotStateLoggedIn || bot.state == BotStateReady || bot.state == BotStateBusy,
+			Ready:     bot.state == BotStateReady || bot.state == BotStateBusy,
+			Busy:      bot.state == BotStateBusy,
 		}
-		bot.Mutex.Unlock()
+		bot.mutex.Unlock()
 		
 		botStatuses = append(botStatuses, status)
 		
@@ -491,13 +540,13 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 			readyCount++
 		}
 	}
-	botMutex.Unlock()
+	botManager.mutex.RUnlock()
 	
 	// Determine overall status
 	status := "healthy"
 	if readyCount == 0 {
 		status = "unhealthy"
-	} else if readyCount < len(bots) {
+	} else if readyCount < len(botManager.bots) {
 		status = "degraded"
 	}
 	
@@ -572,12 +621,12 @@ func handleHistory(w http.ResponseWriter, r *http.Request) {
 		Success: true,
 		History: history,
 	})
-} 
+}
 
 // getKilleaterValue returns the KilleaterValue if it's >= 0, otherwise returns -1
 func getKilleaterValue(value int32) int32 {
 	if value >= 0 {
 		return value
 	}
-	return 0
+	return -1
 }

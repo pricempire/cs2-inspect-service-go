@@ -6,6 +6,9 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -92,6 +95,15 @@ var PatternNames = map[string]map[int16]string{
 	// Add more weapons as needed
 }
 
+// CHPatterns stores Case Hardened pattern tiers
+var CHPatterns map[string]map[string][]int
+
+// FadePercentages stores fade percentages by pattern seed
+var FadePercentages map[string]map[string][]int
+
+// MarbleFadePatterns stores marble fade pattern types
+var MarbleFadePatterns map[string]map[string][]int
+
 var (
 	schema     *Schema
 	schemaLock sync.RWMutex
@@ -122,6 +134,64 @@ func LoadSchema() error {
 	
 	log.Println("Schema loaded successfully")
 	return nil
+}
+
+// LoadPatternFiles loads pattern data from JSON files
+func LoadPatternFiles() error {
+	log.Println("Loading pattern files...")
+	
+	// Load Case Hardened patterns
+	chData, err := loadJSONFile("static/ch-patterns.json")
+	if err != nil {
+		return fmt.Errorf("failed to load CH patterns: %v", err)
+	}
+	
+	CHPatterns = make(map[string]map[string][]int)
+	if err := json.Unmarshal(chData, &CHPatterns); err != nil {
+		return fmt.Errorf("failed to unmarshal CH patterns: %v", err)
+	}
+	
+	// Load Fade percentages
+	fadeData, err := loadJSONFile("static/fade-percentages.json")
+	if err != nil {
+		return fmt.Errorf("failed to load Fade percentages: %v", err)
+	}
+	
+	FadePercentages = make(map[string]map[string][]int)
+	if err := json.Unmarshal(fadeData, &FadePercentages); err != nil {
+		return fmt.Errorf("failed to unmarshal Fade percentages: %v", err)
+	}
+	
+	// Load Marble Fade patterns
+	marbleData, err := loadJSONFile("static/marble-fade-patterns.json")
+	if err != nil {
+		return fmt.Errorf("failed to load Marble Fade patterns: %v", err)
+	}
+	
+	MarbleFadePatterns = make(map[string]map[string][]int)
+	if err := json.Unmarshal(marbleData, &MarbleFadePatterns); err != nil {
+		return fmt.Errorf("failed to unmarshal Marble Fade patterns: %v", err)
+	}
+	
+	log.Println("Pattern files loaded successfully")
+	return nil
+}
+
+// loadJSONFile loads a JSON file from the given path
+func loadJSONFile(path string) ([]byte, error) {
+	// Get the absolute path to the file
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	
+	// Read the file
+	data, err := os.ReadFile(absPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %v", err)
+	}
+	
+	return data, nil
 }
 
 // GetSchema returns the loaded schema
@@ -156,11 +226,105 @@ func GetPhaseName(paintIndex int16) string {
 
 // GetPatternName returns the pattern name for a specific weapon and seed
 func GetPatternName(marketHashName string, paintSeed int16) string {
+	// Check hardcoded patterns first
 	if patterns, ok := PatternNames[marketHashName]; ok {
 		if name, ok := patterns[paintSeed]; ok {
 			return name
 		}
 	}
+	
+	// Check for Case Hardened patterns
+	if strings.Contains(marketHashName, "Case Hardened") {
+		// Extract the knife/weapon type
+		weaponType := getWeaponTypeFromName(marketHashName)
+		if weaponType != "" {
+			if patterns, ok := CHPatterns[weaponType]; ok {
+				for tier, seeds := range patterns {
+					for _, seed := range seeds {
+						if int16(seed) == paintSeed {
+							return fmt.Sprintf("%s %s", tier, "Blue Gem")
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// Check for Marble Fade patterns
+	if strings.Contains(marketHashName, "Marble Fade") {
+		// Extract the knife/weapon type
+		weaponType := getWeaponTypeFromName(marketHashName)
+		if weaponType != "" {
+			if patterns, ok := MarbleFadePatterns[weaponType]; ok {
+				for patternName, seeds := range patterns {
+					for _, seed := range seeds {
+						if int16(seed) == paintSeed {
+							return patternName
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Check for Fade percentages
+	if strings.Contains(marketHashName, "Fade") {
+		// Extract the knife/weapon type
+		weaponType := getWeaponTypeFromName(marketHashName)
+		if weaponType != "" {
+			if percentages, ok := FadePercentages[weaponType]; ok {
+				for percentage, seeds := range percentages {
+					for _, seed := range seeds {
+						if int16(seed) == paintSeed {
+							return fmt.Sprintf("%s%% Fade", percentage)
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	return ""
+}
+
+// getWeaponTypeFromName extracts the weapon type from a market hash name
+func getWeaponTypeFromName(marketHashName string) string {
+	// Map of market hash name prefixes to pattern file keys
+	nameToKey := map[string]string{
+		"★ Karambit":           "karambit",
+		"★ M9 Bayonet":         "m9",
+		"★ Bayonet":            "bayonet",
+		"★ Butterfly Knife":    "butterfly",
+		"★ Falchion Knife":     "falchion",
+		"★ Flip Knife":         "flip",
+		"★ Gut Knife":          "gut",
+		"★ Huntsman Knife":     "huntsman",
+		"★ Shadow Daggers":     "shadow",
+		"★ Bowie Knife":        "bowie",
+		"★ Ursus Knife":        "ursus",
+		"★ Navaja Knife":       "navaja",
+		"★ Stiletto Knife":     "stiletto",
+		"★ Talon Knife":        "talon",
+		"★ Skeleton Knife":     "skeleton",
+		"★ Nomad Knife":        "nomad",
+		"★ Survival Knife":     "survival",
+		"★ Paracord Knife":     "paracord",
+		"★ Classic Knife":      "classic",
+		"AK-47":                "ak47",
+		"AWP":                  "awp",
+		"Desert Eagle":         "deagle",
+		"Glock-18":             "glock",
+		"M4A1-S":               "m4a1s",
+		"M4A4":                 "m4a4",
+		"USP-S":                "usp",
+	}
+	
+	for prefix, key := range nameToKey {
+		if strings.HasPrefix(marketHashName, prefix) {
+			return key
+		}
+	}
+	
 	return ""
 }
 
@@ -245,6 +409,11 @@ func StartSchemaUpdater() {
 		// Load schema initially
 		if err := LoadSchema(); err != nil {
 			log.Printf("Failed to load initial schema: %v", err)
+		}
+		
+		// Load pattern files
+		if err := LoadPatternFiles(); err != nil {
+			log.Printf("Failed to load pattern files: %v", err)
 		}
 		
 		// Update schema every 24 hours

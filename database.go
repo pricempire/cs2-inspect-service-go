@@ -66,7 +66,7 @@ type Asset struct {
 	PaintIndex       int16     `json:"paintIndex,omitempty"`
 	PaintWear        float64   `json:"paintWear,omitempty"`
 	Quality          int16     `json:"quality,omitempty"`
-	CustomName       string    `json:"customName,omitempty"`
+	CustomName       sql.NullString `json:"customName,omitempty"`
 	DefIndex         int16     `json:"defIndex,omitempty"`
 	Origin           int16     `json:"origin,omitempty"`
 	Rarity           int16     `json:"rarity,omitempty"`

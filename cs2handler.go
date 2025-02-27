@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"sync"
 	"time"
@@ -37,7 +36,8 @@ type CS2Handler struct {
 	itemInfoRequest chan struct {
 		paramA uint64
 		paramD uint64
-		owner  uint64
+		paramS uint64
+		paramM uint64
 	}
 	responseChannel chan []byte
 	lastHelloTime   time.Time
@@ -54,7 +54,8 @@ func NewCS2Handler(client *goSteam.Client) *CS2Handler {
 		itemInfoRequest: make(chan struct {
 			paramA uint64
 			paramD uint64
-			owner  uint64
+			paramS uint64
+			paramM uint64
 		}, 10), // Buffer for up to 10 requests
 		responseChannel: make(chan []byte, 10), // Increase buffer size to 10 to reduce chance of blocking
 		lastHelloTime:   time.Time{},
@@ -85,12 +86,12 @@ func (h *CS2Handler) startHelloTicker() {
 			if !ready {
 				// Check if we've exceeded the maximum number of hello attempts
 				if h.helloAttempts >= MaxHelloAttempts {
-					log.Printf("CS2Handler: Max hello attempts reached (%d), waiting for bot reconnect", MaxHelloAttempts)
+					LogWarning("Max hello attempts reached (%d), waiting for bot reconnect", MaxHelloAttempts)
 					h.helloAttempts = 0
 					time.Sleep(2 * time.Minute) // Wait longer before trying again
 				} else {
 					h.helloAttempts++
-					log.Printf("CS2Handler: Not ready, sending hello (attempt %d/%d)", h.helloAttempts, MaxHelloAttempts)
+					LogInfo("Not ready, sending hello (attempt %d/%d)", h.helloAttempts, MaxHelloAttempts)
 					h.SendHello()
 				}
 			} else if ready {
@@ -99,7 +100,7 @@ func (h *CS2Handler) startHelloTicker() {
 			}
 			
 		case <-h.stopHelloTicker:
-			log.Println("CS2Handler: Hello ticker stopped")
+			LogInfo("Hello ticker stopped")
 			return
 		}
 	}
@@ -119,10 +120,10 @@ func (h *CS2Handler) SetReady(ready bool) {
 	
 	// If transitioning from not ready to ready, log it
 	if !h.ready && ready {
-		log.Println("CS2Handler: Now ready to process requests")
+		LogInfo("Now ready to process requests")
 		h.helloAttempts = 0 // Reset hello attempts
 	} else if h.ready && !ready {
-		log.Println("CS2Handler: No longer ready to process requests")
+		LogInfo("No longer ready to process requests")
 	}
 	
 	h.ready = ready
@@ -130,34 +131,34 @@ func (h *CS2Handler) SetReady(ready bool) {
 
 // HandleGCPacket handles Game Coordinator packets
 func (h *CS2Handler) HandleGCPacket(packet *gamecoordinator.GCPacket) {
-	log.Printf("HandleGCPacket called with AppId: %d, MsgType: %d (0x%x)", packet.AppId, packet.MsgType, packet.MsgType)
+	LogDebug("HandleGCPacket called with AppId: %d, MsgType: %d (0x%x)", packet.AppId, packet.MsgType, packet.MsgType)
 	
 	if packet.AppId != CS2AppID {
-		log.Printf("Ignoring packet for AppId: %d", packet.AppId)
+		LogDebug("Ignoring packet for AppId: %d", packet.AppId)
 		return
 	}  
 
 	switch packet.MsgType {
 	case uint32(csgoProto.EGCBaseClientMsg_k_EMsgGCClientWelcome):
 		h.SetReady(true)
-		log.Println("Connected to CS2 Game Coordinator!")
+		LogInfo("Connected to CS2 Game Coordinator!")
 		
 		// Process any pending item info requests
 		select {
 		case req := <-h.itemInfoRequest:
-			log.Printf("Processing pending item info request")
-			h.requestItemInfo(req.paramA, req.paramD, req.owner)
+			LogInfo("Processing pending item info request")
+			h.requestItemInfo(req.paramA, req.paramD, req.paramS, req.paramM)
 		default:
 			// No pending requests
 		}
 	
 	case uint32(csgoProto.EGCBaseClientMsg_k_EMsgGCClientConnectionStatus):
-		log.Println("Received connection status message from GC")
+		LogInfo("Received connection status message from GC")
 		
 		// The connection status message indicates we're connected to the GC
 		// Set ready to true if it's not already
 		if !h.IsReady() {
-			log.Println("Setting ready state to true based on connection status message")
+			LogInfo("Setting ready state to true based on connection status message")
 			h.SetReady(true)
 		}
 	
@@ -165,58 +166,58 @@ func (h *CS2Handler) HandleGCPacket(packet *gamecoordinator.GCPacket) {
 		// Handle the item info response
 		h.HandleItemInfoResponse(packet)
 	default:
-		log.Printf("Received unknown GC message type: %d (0x%x)", packet.MsgType, packet.MsgType)
+		LogDebug("Received unknown GC message type: %d (0x%x)", packet.MsgType, packet.MsgType)
 	}
 }
 
 // HandleItemInfoResponse handles the response from the Game Coordinator for an item info request
 func (h *CS2Handler) HandleItemInfoResponse(packet *gamecoordinator.GCPacket) {
-	log.Printf("Received item info response with %d bytes of data", len(packet.Body))
+	LogInfo("Received item info response with %d bytes of data", len(packet.Body))
 	
 	// Parse the protobuf message to validate it
 	var response csgoProto.CMsgGCCStrike15V2_Client2GCEconPreviewDataBlockResponse
 	if err := proto.Unmarshal(packet.Body, &response); err != nil {
-		log.Printf("Error unmarshaling response: %v", err)
+		LogError("Error unmarshaling response: %v", err)
 		return
 	}
 	
 	// Log the response details
 	if response.Iteminfo != nil {
-		log.Printf("Received item info: DefIndex=%d, PaintIndex=%d, PaintWear=%f, PaintSeed=%d",
+		LogInfo("Received item info: DefIndex=%d, PaintIndex=%d, PaintWear=%f, PaintSeed=%d",
 			response.Iteminfo.GetDefindex(), 
 			response.Iteminfo.GetPaintindex(),
 			convertPaintWearToFloat(response.Iteminfo.GetPaintwear()),
 			response.Iteminfo.GetPaintseed())
 	} else {
-		log.Println("Response contains no item info")
+		LogWarning("Response contains no item info")
 	}
 	
 	// Always send the response data to the channel, even if it doesn't contain item info
 	// This allows the handler to properly respond to the client with an error
 	select {
 	case h.responseChannel <- packet.Body:
-		log.Println("Sent response data to channel")
+		LogDebug("Sent response data to channel")
 	default:
-		log.Println("Failed to send response data to channel (channel full or closed)")
+		LogWarning("Failed to send response data to channel (channel full or closed)")
 		// Try to clear the channel and send again
 		select {
 		case <-h.responseChannel:
 			// Channel cleared, now try to send again
 			select {
 			case h.responseChannel <- packet.Body:
-				log.Println("Sent response data to channel after clearing")
+				LogInfo("Sent response data to channel after clearing")
 			default:
-				log.Println("Still failed to send response data to channel")
+				LogError("Still failed to send response data to channel")
 			}
 		default:
-			log.Println("Could not clear channel")
+			LogError("Could not clear channel")
 		}
 	}
 }
 
 // SendHello sends a hello message to the Game Coordinator
 func (h *CS2Handler) SendHello() {
-	log.Println("Sending hello to CS2 Game Coordinator...")
+	LogInfo("Sending hello to CS2 Game Coordinator...")
 	
 	// Create an empty message (hello doesn't need any data)
 	data := make([]byte, 0)
@@ -229,57 +230,74 @@ func (h *CS2Handler) SendHello() {
 	h.lastHelloTime = time.Now()
 }
 
+// SendGoodbye sends a goodbye message to the Game Coordinator
+func (h *CS2Handler) SendGoodbye() {
+	LogInfo("Sending goodbye to CS2 Game Coordinator...")
+	
+	// Create an empty message (goodbye doesn't need any data)
+	data := make([]byte, 0)
+	
+	// Send the goodbye message to the Game Coordinator
+	// Use the constant value 4008 directly since the csgoProto package doesn't have this constant
+	gcMsg := gamecoordinator.NewGCMsg(CS2AppID, 4008, ByteSlice(data))
+	h.client.GC.Write(gcMsg)
+}
+
 // RequestItemInfo queues a request for item information
-func (h *CS2Handler) RequestItemInfo(paramA, paramD, owner uint64) {
-	if h.IsReady() {
-		log.Printf("GC is ready, requesting item info immediately...")
-		h.requestItemInfo(paramA, paramD, owner)
-	} else {
-		log.Printf("GC not ready, queueing item info request...")
+func (h *CS2Handler) RequestItemInfo(paramA, paramD, paramS, paramM uint64) {
+	if !h.IsReady() {
+		LogWarning("GC not ready, queueing item info request...")
 		// Queue the request to be processed when the GC is ready
 		h.itemInfoRequest <- struct {
 			paramA uint64
 			paramD uint64
-			owner  uint64
-		}{paramA, paramD, owner}
+			paramS uint64
+			paramM uint64
+		}{paramA, paramD, paramS, paramM}
+	} else {
+		h.requestItemInfo(paramA, paramD, paramS, paramM)
 	}
 }
 
 // requestItemInfo sends a request for item information to the Game Coordinator
-func (h *CS2Handler) requestItemInfo(paramA, paramD, owner uint64) {
-	log.Printf("Requesting item info for A:%d D:%d Owner:%d", paramA, paramD, owner)
+func (h *CS2Handler) requestItemInfo(paramA, paramD, paramS, paramM uint64) {
+	LogInfo("Requesting item info for A:%d D:%d S:%d M:%d", paramA, paramD, paramS, paramM)
 	 
 	// Clear the response channel before sending a new request
 	select {
 	case <-h.responseChannel:
-		log.Println("Cleared previous response from channel")
+		LogDebug("Cleared previous response from channel")
 	default:
 		// Channel was already empty
 	}
 	
 	// Create a protobuf message for the request
 	request := &csgoProto.CMsgGCCStrike15V2_Client2GCEconPreviewDataBlockRequest{
-		ParamS: proto.Uint64(owner),  // S parameter is the owner
 		ParamA: proto.Uint64(paramA), // A parameter
 		ParamD: proto.Uint64(paramD), // D parameter
+	}
+	
+	// Set either ParamS or ParamM based on which one is non-zero
+	if paramS > 0 {
+		request.ParamS = proto.Uint64(paramS) // S parameter is the owner
+		request.ParamM = proto.Uint64(0)
+	} else if paramM > 0 { 
+		request.ParamS = proto.Uint64(0)
+		request.ParamM = proto.Uint64(paramM) // M parameter is the market listing ID
 	}
 	
 	// Serialize the protobuf message
 	data, err := proto.Marshal(request)
 	if err != nil {
-		log.Printf("Error marshaling request: %v", err)
+		LogError("Error marshaling request: %v", err)
 		return
 	}
 	
 	// Log the request data for debugging
-	log.Printf("Sending item info request with data length: %d bytes", len(data))
+	LogDebug("Sending item info request with data length: %d bytes", len(data))
 	
 	// Send the inspection request to the Game Coordinator
-	gcMsg := gamecoordinator.NewGCMsgProtobuf(CS2AppID, uint32(csgoProto.ECsgoGCMsg_k_EMsgGCCStrike15_v2_Client2GCEconPreviewDataBlockRequest), &csgoProto.CMsgGCCStrike15V2_Client2GCEconPreviewDataBlockRequest{
-		ParamS: proto.Uint64(owner),
-		ParamA: proto.Uint64(paramA),
-		ParamD: proto.Uint64(paramD),
-	})
+	gcMsg := gamecoordinator.NewGCMsgProtobuf(CS2AppID, uint32(csgoProto.ECsgoGCMsg_k_EMsgGCCStrike15_v2_Client2GCEconPreviewDataBlockRequest), request)
 	h.client.GC.Write(gcMsg)
 }
 
@@ -299,7 +317,7 @@ func (h *CS2Handler) CheckGCConnection() bool {
 	
 	// If not ready and it's been a while since the last hello, send one
 	if time.Since(h.lastHelloTime) > HelloInterval {
-		log.Println("CheckGCConnection: Not ready and hello interval elapsed, sending hello")
+		LogInfo("CheckGCConnection: Not ready and hello interval elapsed, sending hello")
 		h.SendHello()
 	}
 	
@@ -362,7 +380,7 @@ func ExtractItemInfo(responseData []byte) (*ItemInfo, error) {
 		PetIndex:          response.Iteminfo.GetPetindex(),
 	} 
 
-	log.Println("ItemInfo: ", response.Iteminfo)
+	LogDebug("ItemInfo: %+v", response.Iteminfo)
 	
 	// Determine if the item is Souvenir
 	// Origin 12 is tournament drops (Souvenir)
