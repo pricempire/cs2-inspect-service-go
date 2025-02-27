@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	_ "github.com/lib/pq"
@@ -62,27 +63,27 @@ type Asset struct {
 	AssetID          int64     `json:"assetId"`
 	Ms               int64     `json:"ms"`
 	D                string    `json:"d"`
-	PaintSeed        int16     `json:"paintSeed,omitempty"`
-	PaintIndex       int16     `json:"paintIndex,omitempty"`
-	PaintWear        float64   `json:"paintWear,omitempty"`
-	Quality          int16     `json:"quality,omitempty"`
+	PaintSeed        sql.NullInt16 `json:"paintSeed,omitempty"`
+	PaintIndex       sql.NullInt16 `json:"paintIndex,omitempty"`
+	PaintWear        sql.NullFloat64 `json:"paintWear,omitempty"`
+	Quality          sql.NullInt16 `json:"quality,omitempty"`
 	CustomName       sql.NullString `json:"customName,omitempty"`
-	DefIndex         int16     `json:"defIndex,omitempty"`
-	Origin           int16     `json:"origin,omitempty"`
-	Rarity           int16     `json:"rarity,omitempty"`
-	QuestID          int16     `json:"questId,omitempty"`
-	Reason           int16     `json:"reason,omitempty"`
-	MusicIndex       int16     `json:"musicIndex,omitempty"`
-	EntIndex         int16     `json:"entIndex,omitempty"`
+	DefIndex         sql.NullInt16 `json:"defIndex,omitempty"`
+	Origin           sql.NullInt16 `json:"origin,omitempty"`
+	Rarity           sql.NullInt16 `json:"rarity,omitempty"`
+	QuestID          sql.NullInt16 `json:"questId,omitempty"`
+	Reason           sql.NullInt16 `json:"reason,omitempty"`
+	MusicIndex       sql.NullInt16 `json:"musicIndex,omitempty"`
+	EntIndex         sql.NullInt16 `json:"entIndex,omitempty"`
 	IsStattrak       bool      `json:"isStattrak"`
 	IsSouvenir       bool      `json:"isSouvenir"`
 	Stickers         []byte    `json:"stickers,omitempty"`    // JSON data
 	Keychains        []byte    `json:"keychains,omitempty"`   // JSON data
-	KilleaterScoreType int16   `json:"killeaterScoreType,omitempty"`
-	KilleaterValue   int32     `json:"killeaterValue,omitempty"`
-	PetIndex         int16     `json:"petIndex,omitempty"`
+	KilleaterScoreType sql.NullInt16 `json:"killeaterScoreType,omitempty"`
+	KilleaterValue   sql.NullInt32 `json:"killeaterValue,omitempty"`
+	PetIndex         sql.NullInt16 `json:"petIndex,omitempty"`
 	Inventory        int64     `json:"inventory"`
-	DropReason       int16     `json:"dropReason,omitempty"`
+	DropReason       sql.NullInt16 `json:"dropReason,omitempty"`
 	CreatedAt        time.Time `json:"createdAt"`
 	UpdatedAt        time.Time `json:"updatedAt"`
 }
@@ -189,6 +190,67 @@ func SaveAsset(asset *Asset) error {
 		asset.Keychains = []byte("[]")
 	}
 	
+	// First check if a record with this asset_id, ms, d already exists
+	checkQuery := `
+		SELECT unique_id FROM asset 
+		WHERE asset_id = $1 AND ms = $2 AND d = $3
+		LIMIT 1
+	`
+
+	LogInfo("Checking for existing asset with asset_id %d, ms %d, d %s", asset.AssetID, asset.Ms, asset.D)
+	
+	var existingUniqueID string
+	err := db.QueryRow(checkQuery, asset.AssetID, asset.Ms, asset.D).Scan(&existingUniqueID)
+	if err == nil {
+		// Record already exists, update it instead of trying to insert
+		LogInfo("Asset record already exists with unique_id %s, updating instead of inserting", existingUniqueID)
+		
+		updateQuery := `
+			UPDATE asset SET
+				unique_id = $1,
+				paint_seed = $2,
+				paint_index = $3,
+				paint_wear = $4,
+				quality = $5,
+				custom_name = $6,
+				def_index = $7,
+				origin = $8,
+				rarity = $9,
+				quest_id = $10,
+				reason = $11,
+				music_index = $12,
+				ent_index = $13,
+				is_stattrak = $14,
+				is_souvenir = $15,
+				stickers = $16,
+				keychains = $17,
+				killeater_score_type = $18,
+				killeater_value = $19,
+				pet_index = $20,
+				inventory = $21,
+				drop_reason = $22,
+				updated_at = $23
+			WHERE asset_id = $24 AND ms = $25 AND d = $26
+		`
+		
+		_, err := db.Exec(
+			updateQuery,
+			asset.UniqueID, asset.PaintSeed, 
+			asset.PaintIndex, asset.PaintWear, asset.Quality, asset.CustomName, 
+			asset.DefIndex, asset.Origin, asset.Rarity, asset.QuestID, asset.Reason,
+			asset.MusicIndex, asset.EntIndex, asset.IsStattrak, asset.IsSouvenir, 
+			asset.Stickers, asset.Keychains, asset.KilleaterScoreType, asset.KilleaterValue,
+			asset.PetIndex, asset.Inventory, asset.DropReason, asset.UpdatedAt,
+			asset.AssetID, asset.Ms, asset.D,
+		)
+		
+		return err
+	} else if err != sql.ErrNoRows {
+		// An actual error occurred during the check
+		return fmt.Errorf("error checking for existing asset: %v", err)
+	}
+	
+	// No existing record found, proceed with insert
 	query := `
 		INSERT INTO asset (
 			unique_id, asset_id, ms, d, paint_seed, paint_index, paint_wear, 
@@ -200,33 +262,12 @@ func SaveAsset(asset *Asset) error {
 			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 
 			$16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27
 		)
-		ON CONFLICT (asset_id, ms, d, stickers) DO UPDATE SET
-			unique_id = EXCLUDED.unique_id,
-			paint_seed = EXCLUDED.paint_seed,
-			paint_index = EXCLUDED.paint_index,
-			paint_wear = EXCLUDED.paint_wear,
-			quality = EXCLUDED.quality,
-			custom_name = EXCLUDED.custom_name,
-			def_index = EXCLUDED.def_index,
-			origin = EXCLUDED.origin,
-			rarity = EXCLUDED.rarity,
-			quest_id = EXCLUDED.quest_id,
-			reason = EXCLUDED.reason,
-			music_index = EXCLUDED.music_index,
-			ent_index = EXCLUDED.ent_index,
-			is_stattrak = EXCLUDED.is_stattrak,
-			is_souvenir = EXCLUDED.is_souvenir,
-			stickers = EXCLUDED.stickers,
-			keychains = EXCLUDED.keychains,
-			killeater_score_type = EXCLUDED.killeater_score_type,
-			killeater_value = EXCLUDED.killeater_value,
-			pet_index = EXCLUDED.pet_index,
-			inventory = EXCLUDED.inventory,
-			drop_reason = EXCLUDED.drop_reason,
-			updated_at = EXCLUDED.updated_at
+		ON CONFLICT DO NOTHING
 	`
+
+	LogInfo("Saving asset: %s (AssetID: %d, ms: %d, d: %s)", asset.UniqueID, asset.AssetID, asset.Ms, asset.D)
 	
-	_, err := db.Exec(
+	_, err = db.Exec(
 		query,
 		asset.UniqueID, asset.AssetID, asset.Ms, asset.D, asset.PaintSeed, 
 		asset.PaintIndex, asset.PaintWear, asset.Quality, asset.CustomName, 
@@ -347,7 +388,7 @@ func SaveHistory(history *History) error {
 	if err == nil {
 		// Record already exists, just return the existing ID
 		history.ID = existingId
-		log.Printf("History record already exists with ID %d", existingId)
+		LogInfo("History record already exists with ID %d, skipping insert", existingId)
 		return nil
 	} else if err != sql.ErrNoRows {
 		// An actual error occurred
@@ -366,15 +407,31 @@ func SaveHistory(history *History) error {
 		RETURNING id
 	`
 
-	log.Println("Saving history: ", history.UniqueID, history.AssetID, history.PrevAssetID, history.Owner, history.PrevOwner, history.D, history.Stickers, history.Keychains, history.PrevStickers, history.PrevKeychains, history.Type, history.CreatedAt)
+	LogInfo("Saving history: %s (AssetID: %d, Type: %d)", history.UniqueID, history.AssetID, history.Type)
 	
-	return db.QueryRow(
+	err = db.QueryRow(
 		query,
 		history.UniqueID, history.AssetID, history.PrevAssetID, history.Owner, 
 		history.PrevOwner, history.D, history.Stickers, history.Keychains,
 		history.PrevStickers, history.PrevKeychains, history.Type,
 		history.CreatedAt,
 	).Scan(&history.ID)
+	
+	if err != nil {
+		// Check if this is a duplicate key error
+		if strings.Contains(err.Error(), "duplicate key") {
+			// Try to get the existing ID again
+			err := db.QueryRow(checkQuery, history.UniqueID, history.AssetID).Scan(&existingId)
+			if err == nil {
+				history.ID = existingId
+				LogInfo("Recovered from duplicate key error, history record exists with ID %d", existingId)
+				return nil
+			}
+		}
+		return fmt.Errorf("error saving history: %v", err)
+	}
+	
+	return nil
 }
 
 // FindHistoryByUniqueID looks up history records for an item by its unique ID

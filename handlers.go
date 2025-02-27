@@ -85,21 +85,21 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 			
 			// Create item info from the asset
 			itemInfo := &ItemInfo{
-				DefIndex:          uint32(asset.DefIndex),
-				PaintIndex:        uint32(asset.PaintIndex),
-				Rarity:            uint32(asset.Rarity),
-				Quality:           uint32(asset.Quality),
-				PaintWear:         asset.PaintWear,
-				PaintSeed:         uint32(asset.PaintSeed),
+				DefIndex:          uint32(asset.DefIndex.Int16),
+				PaintIndex:        uint32(asset.PaintIndex.Int16),
+				Rarity:            uint32(asset.Rarity.Int16),
+				Quality:           uint32(asset.Quality.Int16),
+				PaintWear:         asset.PaintWear.Float64,
+				PaintSeed:         uint32(asset.PaintSeed.Int16),
 				CustomName:        asset.CustomName.String,
-				KilleaterScoreType: uint32(asset.KilleaterScoreType),
-				KilleaterValue:    getKilleaterValue(asset.KilleaterValue),
-				Origin:            uint32(asset.Origin),
-				QuestId:           uint32(asset.QuestID),
-				DropReason:        uint32(asset.DropReason),
-				MusicIndex:        uint32(asset.MusicIndex),
-				EntIndex:          int32(asset.EntIndex),
-				PetIndex:          uint32(asset.PetIndex),
+				KilleaterScoreType: uint32(asset.KilleaterScoreType.Int16),
+				KilleaterValue:    getKilleaterValue(asset.KilleaterValue.Int32),
+				Origin:            uint32(asset.Origin.Int16),
+				QuestId:           uint32(asset.QuestID.Int16),
+				DropReason:        uint32(asset.DropReason.Int16),
+				MusicIndex:        uint32(asset.MusicIndex.Int16),
+				EntIndex:          int32(asset.EntIndex.Int16),
+				PetIndex:          uint32(asset.PetIndex.Int16),
 				Inventory:         uint32(asset.Inventory),
 				IsStatTrak:        asset.IsStattrak,
 				IsSouvenir:        asset.IsSouvenir,
@@ -245,27 +245,27 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 				AssetID:            int64(paramA),
 				Ms:                 msValue,
 				D:                  strconv.FormatUint(paramD, 10),
-				PaintSeed:          int16(itemInfo.PaintSeed),
-				PaintIndex:         int16(itemInfo.PaintIndex),
-				PaintWear:          float64(itemInfo.PaintWear),
-				Quality:            int16(itemInfo.Quality),
+				PaintSeed:          sql.NullInt16{Int16: int16(itemInfo.PaintSeed), Valid: true},
+				PaintIndex:         sql.NullInt16{Int16: int16(itemInfo.PaintIndex), Valid: true},
+				PaintWear:          sql.NullFloat64{Float64: float64(itemInfo.PaintWear), Valid: itemInfo.PaintWear > 0},
+				Quality:            sql.NullInt16{Int16: int16(itemInfo.Quality), Valid: true},
 				CustomName:         sql.NullString{String: itemInfo.CustomName, Valid: itemInfo.CustomName != ""},
-				DefIndex:           int16(itemInfo.DefIndex),
-				Rarity:             int16(itemInfo.Rarity),
-				Origin:             int16(itemInfo.Origin),
-				QuestID:            int16(itemInfo.QuestId),
-				Reason:             int16(itemInfo.DropReason),
-				MusicIndex:         int16(itemInfo.MusicIndex),
-				EntIndex:           int16(itemInfo.EntIndex),
-				PetIndex:           int16(itemInfo.PetIndex),
+				DefIndex:           sql.NullInt16{Int16: int16(itemInfo.DefIndex), Valid: true},
+				Rarity:             sql.NullInt16{Int16: int16(itemInfo.Rarity), Valid: true},
+				Origin:             sql.NullInt16{Int16: int16(itemInfo.Origin), Valid: true},
+				QuestID:            sql.NullInt16{Int16: int16(itemInfo.QuestId), Valid: itemInfo.QuestId > 0},
+				Reason:             sql.NullInt16{Int16: int16(itemInfo.DropReason), Valid: itemInfo.DropReason > 0},
+				MusicIndex:         sql.NullInt16{Int16: int16(itemInfo.MusicIndex), Valid: itemInfo.MusicIndex > 0},
+				EntIndex:           sql.NullInt16{Int16: int16(itemInfo.EntIndex), Valid: itemInfo.EntIndex != 0},
+				PetIndex:           sql.NullInt16{Int16: int16(itemInfo.PetIndex), Valid: itemInfo.PetIndex > 0},
 				IsStattrak:         itemInfo.IsStatTrak,
 				IsSouvenir:         itemInfo.IsSouvenir,
 				Stickers:           stickersJSON,
 				Keychains:          keychainsJSON,
-				KilleaterScoreType: int16(itemInfo.KilleaterScoreType),
-				KilleaterValue:     int32(itemInfo.KilleaterValue),
+				KilleaterScoreType: sql.NullInt16{Int16: int16(itemInfo.KilleaterScoreType), Valid: itemInfo.KilleaterScoreType > 0},
+				KilleaterValue:     sql.NullInt32{Int32: int32(itemInfo.KilleaterValue), Valid: itemInfo.KilleaterValue >= 0},
 				Inventory:          int64(itemInfo.Inventory),
-				DropReason:         int16(itemInfo.DropReason),
+				DropReason:         sql.NullInt16{Int16: int16(itemInfo.DropReason), Valid: itemInfo.DropReason > 0},
 			}
 
 			// Create a history record
@@ -323,20 +323,24 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 				}
 			} else {
 				// This is a new item, determine history type based on origin
-				switch asset.Origin {
-				case 8:
-					historyType = HistoryTypeTradedUp
-				case 4:
-					historyType = HistoryTypeDropped
-				case 1:
-					historyType = HistoryTypePurchasedIngame
-				case 2:
-					historyType = HistoryTypeUnboxed
-				case 3:
-					historyType = HistoryTypeCrafted
-				case 12:
-					historyType = HistoryTypeDropped // Tournament drops
-				default:
+				if asset.Origin.Valid {
+					switch asset.Origin.Int16 {
+					case 8:
+						historyType = HistoryTypeTradedUp
+					case 4:
+						historyType = HistoryTypeDropped
+					case 1:
+						historyType = HistoryTypePurchasedIngame
+					case 2:
+						historyType = HistoryTypeUnboxed
+					case 3:
+						historyType = HistoryTypeCrafted
+					case 12:
+						historyType = HistoryTypeDropped // Tournament drops
+					default:
+						historyType = HistoryTypeUnknown
+					}
+				} else {
 					historyType = HistoryTypeUnknown
 				}
 			}
@@ -465,6 +469,7 @@ func applySchemaToItemInfo(itemInfo *ItemInfo) {
 		}
 		
 		// Add sticker names from schema
+		LogInfo("Processing %d stickers for item %s", len(itemInfo.Stickers), itemInfo.MarketHashName)
 		for i := range itemInfo.Stickers {
 			stickerIDStr := fmt.Sprintf("%d", itemInfo.Stickers[i].ID)
 			LogDebug("Looking up sticker name for ID: %s", stickerIDStr)
@@ -472,11 +477,32 @@ func applySchemaToItemInfo(itemInfo *ItemInfo) {
 				itemInfo.Stickers[i].Name = sticker.MarketHashName
 				LogDebug("Found sticker name: %s", sticker.MarketHashName)
 			} else {
-				LogWarning("Sticker ID %s not found in schema", stickerIDStr)
+				LogWarning("Sticker ID %s not found in schema (schema has %d stickers)", 
+					stickerIDStr, len(s.Stickers))
+				
+				// Try to find the sticker by iterating through all stickers
+				// This is a fallback in case the ID format is different
+				found := false
+				for schemaID, schemaSticker := range s.Stickers {
+					if schemaID == stickerIDStr || 
+					   fmt.Sprintf("%v", itemInfo.Stickers[i].ID) == schemaID {
+						itemInfo.Stickers[i].Name = schemaSticker.MarketHashName
+						LogDebug("Found sticker name through iteration: %s", schemaSticker.MarketHashName)
+						found = true
+						break
+					}
+				}
+				
+				if !found {
+					LogWarning("Could not find sticker name for ID %s after full search", stickerIDStr)
+					// Set a default name to avoid null in the response
+					itemInfo.Stickers[i].Name = fmt.Sprintf("Unknown Sticker (%s)", stickerIDStr)
+				}
 			}
 		}
 		
 		// Add keychain names from schema
+		LogInfo("Processing %d keychains for item %s", len(itemInfo.Keychains), itemInfo.MarketHashName)
 		for i := range itemInfo.Keychains {
 			keychainIDStr := fmt.Sprintf("%d", itemInfo.Keychains[i].ID)
 			LogDebug("Looking up keychain name for ID: %s", keychainIDStr)
@@ -484,7 +510,27 @@ func applySchemaToItemInfo(itemInfo *ItemInfo) {
 				itemInfo.Keychains[i].Name = keychain.MarketHashName
 				LogDebug("Found keychain name: %s", keychain.MarketHashName)
 			} else {
-				LogWarning("Keychain ID %s not found in schema", keychainIDStr)
+				LogWarning("Keychain ID %s not found in schema (schema has %d keychains)", 
+					keychainIDStr, len(s.Keychains))
+				
+				// Try to find the keychain by iterating through all keychains
+				// This is a fallback in case the ID format is different
+				found := false
+				for schemaID, schemaKeychain := range s.Keychains {
+					if schemaID == keychainIDStr || 
+					   fmt.Sprintf("%v", itemInfo.Keychains[i].ID) == schemaID {
+						itemInfo.Keychains[i].Name = schemaKeychain.MarketHashName
+						LogDebug("Found keychain name through iteration: %s", schemaKeychain.MarketHashName)
+						found = true
+						break
+					}
+				}
+				
+				if !found {
+					LogWarning("Could not find keychain name for ID %s after full search", keychainIDStr)
+					// Set a default name to avoid null in the response
+					itemInfo.Keychains[i].Name = fmt.Sprintf("Unknown Keychain (%s)", keychainIDStr)
+				}
 			}
 		}
 		
@@ -537,6 +583,21 @@ func applySchemaToItemInfo(itemInfo *ItemInfo) {
 		
 		if itemInfo.IsSouvenir {
 			itemInfo.IsSouvenir = true
+		}
+		
+		// Final check to ensure all stickers and keychains have names
+		for i := range itemInfo.Stickers {
+			if itemInfo.Stickers[i].Name == "" {
+				LogWarning("Sticker at index %d still has no name after processing, setting default", i)
+				itemInfo.Stickers[i].Name = fmt.Sprintf("Unknown Sticker (%d)", itemInfo.Stickers[i].ID)
+			}
+		}
+		
+		for i := range itemInfo.Keychains {
+			if itemInfo.Keychains[i].Name == "" {
+				LogWarning("Keychain at index %d still has no name after processing, setting default", i)
+				itemInfo.Keychains[i].Name = fmt.Sprintf("Unknown Keychain (%d)", itemInfo.Keychains[i].ID)
+			}
 		}
 	}
 }

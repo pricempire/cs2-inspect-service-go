@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -111,28 +112,63 @@ var (
 
 // LoadSchema loads the CS2 item schema from CSFloat
 func LoadSchema() error {
-	log.Println("Loading schema from CSFloat...")
+	LogInfo("Loading schema from CSFloat...")
 	
-	resp, err := http.Get("https://csfloat.com/api/v1/schema")
+	// Create a client with a timeout
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+	
+	// Make the request
+	resp, err := client.Get("https://csfloat.com/api/v1/schema")
 	if err != nil {
-		return fmt.Errorf("failed to fetch schema: %v", err)
+		LogError("Failed to fetch schema: %v", err)
+		return loadSchemaFromFile() // Try to load from file as fallback
 	}
 	defer resp.Body.Close()
 	
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		LogError("Schema API returned non-OK status: %d", resp.StatusCode)
+		return loadSchemaFromFile() // Try to load from file as fallback
+	}
+	
+	// Read the response body
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("failed to read schema response: %v", err)
+		LogError("Failed to read schema response: %v", err)
+		return loadSchemaFromFile() // Try to load from file as fallback
 	}
 	
 	LogInfo("Received schema response with %d bytes", len(body))
 	
-	schemaLock.Lock()
-	defer schemaLock.Unlock()
-	
-	schema = &Schema{}
-	if err := json.Unmarshal(body, schema); err != nil {
-		return fmt.Errorf("failed to unmarshal schema: %v", err)
+	// Create a temporary schema to unmarshal into
+	tempSchema := &Schema{}
+	if err := json.Unmarshal(body, tempSchema); err != nil {
+		LogError("Failed to unmarshal schema: %v", err)
+		return loadSchemaFromFile() // Try to load from file as fallback
 	}
+	
+	// Validate the schema
+	if tempSchema.Stickers == nil || len(tempSchema.Stickers) == 0 {
+		LogError("Schema is invalid: no stickers found")
+		return loadSchemaFromFile() // Try to load from file as fallback
+	}
+	
+	if tempSchema.Keychains == nil || len(tempSchema.Keychains) == 0 {
+		LogError("Schema is invalid: no keychains found")
+		return loadSchemaFromFile() // Try to load from file as fallback
+	}
+	
+	if tempSchema.Weapons == nil || len(tempSchema.Weapons) == 0 {
+		LogError("Schema is invalid: no weapons found")
+		return loadSchemaFromFile() // Try to load from file as fallback
+	}
+	
+	// Schema is valid, update the global schema
+	schemaLock.Lock()
+	schema = tempSchema
+	schemaLock.Unlock()
 	
 	// Log schema details
 	LogInfo("Schema loaded successfully with %d stickers, %d keychains, %d weapons", 
@@ -149,7 +185,112 @@ func LoadSchema() error {
 		}
 	}
 	
+	// Log a few keychain entries as examples
+	count = 0
+	for id, keychain := range schema.Keychains {
+		if count < 5 {
+			LogDebug("Sample keychain: ID=%s, Name=%s", id, keychain.MarketHashName)
+			count++
+		} else {
+			break
+		}
+	}
+	
+	// Save schema to a file for backup
+	saveSchemaToFile(body)
+	
 	return nil
+}
+
+// loadSchemaFromFile attempts to load the schema from a local file
+func loadSchemaFromFile() error {
+	LogInfo("Attempting to load schema from local file...")
+	
+	// Try to load the latest schema file
+	latestFile := "static/schema_latest.json"
+	if _, err := os.Stat(latestFile); os.IsNotExist(err) {
+		// Try to find any schema file in the static directory
+		files, err := filepath.Glob("static/schema_*.json")
+		if err != nil || len(files) == 0 {
+			LogError("No schema files found in static directory")
+			return fmt.Errorf("failed to load schema from API and no local files found")
+		}
+		
+		// Sort files by name (which includes timestamp) to get the latest
+		sort.Strings(files)
+		latestFile = files[len(files)-1]
+		LogInfo("Using most recent schema file: %s", latestFile)
+	}
+	
+	// Read the file
+	body, err := ioutil.ReadFile(latestFile)
+	if err != nil {
+		LogError("Failed to read schema file: %v", err)
+		return fmt.Errorf("failed to read schema file: %v", err)
+	}
+	
+	LogInfo("Read schema file with %d bytes", len(body))
+	
+	// Create a temporary schema to unmarshal into
+	tempSchema := &Schema{}
+	if err := json.Unmarshal(body, tempSchema); err != nil {
+		LogError("Failed to unmarshal schema from file: %v", err)
+		return fmt.Errorf("failed to unmarshal schema from file: %v", err)
+	}
+	
+	// Validate the schema
+	if tempSchema.Stickers == nil || len(tempSchema.Stickers) == 0 {
+		LogError("Schema from file is invalid: no stickers found")
+		return fmt.Errorf("schema from file is invalid: no stickers found")
+	}
+	
+	if tempSchema.Keychains == nil || len(tempSchema.Keychains) == 0 {
+		LogError("Schema from file is invalid: no keychains found")
+		return fmt.Errorf("schema from file is invalid: no keychains found")
+	}
+	
+	if tempSchema.Weapons == nil || len(tempSchema.Weapons) == 0 {
+		LogError("Schema from file is invalid: no weapons found")
+		return fmt.Errorf("schema from file is invalid: no weapons found")
+	}
+	
+	// Schema is valid, update the global schema
+	schemaLock.Lock()
+	schema = tempSchema
+	schemaLock.Unlock()
+	
+	LogInfo("Schema loaded successfully from file with %d stickers, %d keychains, %d weapons", 
+		len(schema.Stickers), len(schema.Keychains), len(schema.Weapons))
+	
+	return nil
+}
+
+// saveSchemaToFile saves the schema to a file for backup
+func saveSchemaToFile(data []byte) {
+	// Create the directory if it doesn't exist
+	if err := os.MkdirAll("static", 0755); err != nil {
+		LogError("Failed to create static directory: %v", err)
+		return
+	}
+	
+	// Write the schema to a file
+	filename := fmt.Sprintf("static/schema_%s.json", time.Now().Format("20060102_150405"))
+	if err := ioutil.WriteFile(filename, data, 0644); err != nil {
+		LogError("Failed to write schema to file: %v", err)
+		return
+	}
+	
+	LogInfo("Schema saved to file: %s", filename)
+	
+	// Create a symlink to the latest schema
+	latestFile := "static/schema_latest.json"
+	if err := os.Remove(latestFile); err != nil && !os.IsNotExist(err) {
+		LogError("Failed to remove old schema symlink: %v", err)
+	}
+	
+	if err := os.Symlink(filename, latestFile); err != nil {
+		LogError("Failed to create schema symlink: %v", err)
+	}
 }
 
 // LoadPatternFiles loads pattern data from JSON files
@@ -213,15 +354,7 @@ func loadJSONFile(path string) ([]byte, error) {
 // GetSchema returns the loaded schema
 func GetSchema() *Schema {
 	schemaLock.RLock()
-	defer schemaLock.RUnlock()
-	
-	// Debug log to check if schema is loaded
-	if schema == nil {
-		LogError("Schema is nil, make sure it's loaded properly")
-	} else {
-		LogDebug("Schema loaded with %d stickers, %d keychains, %d weapons", 
-			len(schema.Stickers), len(schema.Keychains), len(schema.Weapons))
-	}
+	defer schemaLock.RUnlock() 
 	
 	return schema
 }

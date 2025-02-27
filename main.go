@@ -2,8 +2,10 @@ package main
 
 import (
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -93,6 +95,9 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 	// Get the username from the query string (optional)
 	username := r.URL.Query().Get("username")
 	
+	// Check for force parameter
+	forceRestart := r.URL.Query().Get("force") == "true"
+	
 	// If botManager is nil, return an error
 	if botManager == nil {
 		sendJSONResponse(w, ReconnectResponse{
@@ -113,10 +118,34 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 			bot.mutex.Lock()
 			if bot.account.Username == username {
 				botUsername := bot.account.Username
+				botState := bot.state
 				bot.mutex.Unlock()
 				
-				LogInfo("Manual reconnect triggered for bot: %s", botUsername)
-				bot.Reconnect()
+				LogInfo("Manual reconnect triggered for bot: %s (current state: %s, force: %v)", 
+					botUsername, botState, forceRestart)
+				
+				// If force restart is requested, completely restart the bot
+				if forceRestart {
+					// Start reconnect in a goroutine to avoid blocking the HTTP response
+					go func(b *Bot) {
+						// First try to gracefully disconnect
+						b.mutex.Lock()
+						if b.cs2Handler != nil {
+							b.cs2Handler.SendGoodbye()
+						}
+						b.mutex.Unlock()
+						
+						// Wait a moment for goodbye to be sent
+						time.Sleep(1 * time.Second)
+						
+						// Then force a complete reconnect
+						b.Reconnect()
+					}(bot)
+				} else {
+					// Standard reconnect
+					go bot.Reconnect()
+				}
+				
 				reconnectedCount++
 				break
 			} else {
@@ -128,10 +157,33 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 		for _, bot := range botManager.bots {
 			bot.mutex.Lock()
 			botUsername := bot.account.Username
+			botState := bot.state
 			bot.mutex.Unlock()
 			
-			LogInfo("Manual reconnect triggered for bot: %s", botUsername)
-			bot.Reconnect()
+			LogInfo("Manual reconnect triggered for bot: %s (current state: %s, force: %v)", 
+				botUsername, botState, forceRestart)
+			
+			// Use a goroutine to avoid blocking the HTTP response
+			go func(b *Bot) {
+				// Add a small delay to avoid all bots reconnecting simultaneously
+				time.Sleep(time.Duration(rand.Intn(3)) * time.Second)
+				
+				if forceRestart {
+					// First try to gracefully disconnect
+					b.mutex.Lock()
+					if b.cs2Handler != nil {
+						b.cs2Handler.SendGoodbye()
+					}
+					b.mutex.Unlock()
+					
+					// Wait a moment for goodbye to be sent
+					time.Sleep(1 * time.Second)
+				}
+				
+				// Then force a complete reconnect
+				b.Reconnect()
+			}(bot)
+			
 			reconnectedCount++
 		}
 	}
@@ -139,6 +191,6 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 	// Send response
 	sendJSONResponse(w, ReconnectResponse{
 		Success: true,
-		Message: fmt.Sprintf("Reconnect triggered for %d bots", reconnectedCount),
+		Message: fmt.Sprintf("Reconnect triggered for %d bots (force: %v)", reconnectedCount, forceRestart),
 	})
 } 
