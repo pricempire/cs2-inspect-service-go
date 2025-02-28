@@ -3,8 +3,11 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
+	"fmt"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -239,11 +242,25 @@ type Bot struct {
 	mutex           sync.Mutex
 	ctx             context.Context
 	cancelFunc      context.CancelFunc
+	refreshToken    string // Store the current refresh token
+	sessionFile     string // Path to the session file
 }
 
 // NewBot creates a new bot instance
 func NewBot(account Account, parentCtx context.Context) *Bot {
 	ctx, cancel := context.WithCancel(parentCtx)
+	
+	// Get session directory from env or use default
+	sessionDir := os.Getenv("SESSION_DIR")
+	if sessionDir == "" {
+		sessionDir = os.Getenv("SESSION_FOLDER")
+		if sessionDir == "" {
+			sessionDir = "sessions"
+		}
+	}
+	
+	sessionFile := filepath.Join(sessionDir, account.Username+".json")
+	
 	return &Bot{
 		account:         account,
 		state:           BotStateDisconnected,
@@ -253,6 +270,8 @@ func NewBot(account Account, parentCtx context.Context) *Bot {
 		reconnectAttempts: 0,
 		ctx:             ctx,
 		cancelFunc:      cancel,
+		refreshToken:    account.RefreshToken,
+		sessionFile:     sessionFile,
 	}
 }
 
@@ -295,6 +314,19 @@ func (b *Bot) connect() {
 		}
 		b.mutex.Unlock()
 		
+		// Try to load session
+		session, err := b.loadSession()
+		if err != nil {
+			LogError("Bot %s: Error loading session: %v", b.account.Username, err)
+		}
+		
+		// Update refresh token if found in session
+		if session != nil && session.RefreshToken != "" {
+			b.refreshToken = session.RefreshToken
+			LogInfo("Bot %s: Using refresh token from saved session", b.account.Username)
+		}
+		
+		// Connect to Steam
 		LogInfo("Bot %s: Connecting to Steam...", b.account.Username)
 		
 		// Set up a connection timeout
@@ -312,7 +344,7 @@ func (b *Bot) connect() {
 		case <-connectionSuccess:
 			// Connection attempt completed (may be success or failure)
 			LogInfo("Bot %s: Connection attempt completed", b.account.Username)
-			
+		
 			// Process events
 			connected := false
 			loggedOn := false
@@ -321,11 +353,11 @@ func (b *Bot) connect() {
 			readySignal := make(chan bool, 1)
 			
 			eventTimeout := time.After(60 * time.Second)
-			eventLoop:
+			
 			for {
 				select {
 				case event := <-b.client.Events():
-					switch e := event.(type) {
+					switch event.(type) {
 					case *goSteam.ConnectedEvent:
 						LogInfo("Bot %s: Connected to Steam", b.account.Username)
 						b.mutex.Lock()
@@ -344,6 +376,16 @@ func (b *Bot) connect() {
 							Username: b.account.Username,
 							Password: b.account.Password,
 						}
+						
+						// Use refresh token if available
+						if b.refreshToken != "" {
+							LogInfo("Bot %s: Attempting login with refresh token", b.account.Username)
+							loginDetails.RefreshToken = b.refreshToken
+							loginDetails.Password = "" // Clear password when using refresh token
+						} else {
+							LogInfo("Bot %s: Attempting login with password", b.account.Username)
+						}
+						
 						b.client.Auth.LogOn(loginDetails)
 						
 						// Reset the event timeout after connecting
@@ -359,123 +401,132 @@ func (b *Bot) connect() {
 						// Set game played
 						b.client.GC.SetGamesPlayed(CS2AppID)
 						
-						// Send a hello message after a short delay
-						go func() {
-							time.Sleep(5 * time.Second)
-							b.SendHello()
-							
-							// Check GC readiness after sending hello
-							time.Sleep(2 * time.Second)
-							b.mutex.Lock()
-							if b.state == BotStateLoggedIn {
-								isReady := b.cs2Handler.IsReady()
-								LogInfo("Bot %s: GC ready check after hello - isReady: %v", 
-									b.account.Username, isReady)
-								
-								if isReady {
-									b.state = BotStateReady
-									LogInfo("Bot %s: Ready to handle requests (after hello)", b.account.Username)
-									// Signal to the main loop that we're ready
-									select {
-									case readySignal <- true:
-										LogInfo("Bot %s: Sent ready signal to main event loop", b.account.Username)
-									default:
-										// Channel buffer is full, which means the signal was already sent
-									}
-								}
-							}
-							b.mutex.Unlock()
-						}()
+						// Send hello to GC
+						b.SendHello()
 						
-						// Reset the event timeout after logging in
-						eventTimeout = time.After(60 * time.Second)
+					case *goSteam.MachineAuthUpdateEvent:
+						// Handle Steam Guard
+						LogInfo("Bot %s: Received machine auth update", b.account.Username)
+						
+					case *goSteam.LoginKeyEvent:
+						// Handle login key
+						LogInfo("Bot %s: Received login key", b.account.Username)
 						
 					case *goSteam.DisconnectedEvent:
-						LogWarning("Bot %s: Disconnected from Steam: %v", b.account.Username, e)
-						
+						LogInfo("Bot %s: Disconnected from Steam", b.account.Username)
 						b.mutex.Lock()
-						// Clean up resources
-						if b.cs2Handler != nil {
-							b.cs2Handler.Shutdown()
-						}
-						
 						b.state = BotStateDisconnected
 						b.mutex.Unlock()
 						
-						// Calculate backoff for next reconnect
-						reconnectDelay := b.calculateBackoff()
-						
-						LogInfo("Bot %s: Will reconnect in %v (attempt %d)", 
-							b.account.Username, reconnectDelay, b.reconnectAttempts)
-						
-						// Break out of the event loop to trigger reconnect
-						break eventLoop
+						// Signal disconnection
+						close(readySignal)
+						return
 					}
 					
 					// If we're fully connected and logged in, check if GC is ready
 					if connected && loggedOn {
 						b.mutex.Lock()
 						isReady := b.cs2Handler.IsReady()
-						LogInfo("Bot %s: GC ready check - isReady: %v, current state: %s", 
-							b.account.Username, isReady, b.state)
+						currentState := b.state
+						b.mutex.Unlock()
 						
-						if isReady && b.state == BotStateLoggedIn {
+						if isReady && currentState != BotStateReady {
+							LogInfo("Bot %s: GC ready check after hello - isReady: %v",
+								b.account.Username, isReady)
+							
+							b.mutex.Lock()
 							b.state = BotStateReady
-							LogInfo("Bot %s: Ready to handle requests", b.account.Username)
+							b.mutex.Unlock()
 							
-							// Disable the event timeout when the bot becomes ready
-							// We don't need a timeout for a bot that's fully connected and ready
-							eventTimeout = nil
-							LogInfo("Bot %s: Event timeout disabled for ready bot", b.account.Username)
+							LogInfo("Bot %s: Ready to handle requests (after hello)", b.account.Username)
 							
-							// Signal that we're ready (in case the goroutine hasn't done it yet)
+							// Signal that the bot is ready
 							select {
 							case readySignal <- true:
 								LogInfo("Bot %s: Sent ready signal to main event loop", b.account.Username)
 							default:
-								// Channel buffer is full, which means the signal was already sent
+								// Channel already has a value or is closed
 							}
-						} else if b.state == BotStateReady || b.state == BotStateBusy {
-							// If already in ready or busy state, disable timeout
-							if eventTimeout != nil {
-								eventTimeout = nil
-								LogInfo("Bot %s: Event timeout disabled for bot in state: %s", 
-									b.account.Username, b.state)
-							}
+							
+							// Disable the event timeout
+							eventTimeout = nil
 						}
-						b.mutex.Unlock()
 					}
-					
-					// After processing any event, check if we should disable the timeout
-					b.mutex.Lock()
-					currentState := b.state
-					b.mutex.Unlock()
-					
-					// If the bot is in a stable state, disable the timeout
-					if (currentState == BotStateReady || currentState == BotStateBusy) && eventTimeout != nil {
-						LogInfo("Bot %s: Disabling event timeout for stable state: %s", b.account.Username, currentState)
-						eventTimeout = nil
-					}
-					
-				case <-readySignal:
-					// Bot has become ready, disable the timeout
-					LogInfo("Bot %s: Received ready signal, disabling event timeout", b.account.Username)
-					eventTimeout = nil
 					
 				case <-eventTimeout:
-					// Event processing timed out
-					LogWarning("Bot %s: Event processing timed out", b.account.Username)
-					
+					// Event timeout occurred
 					b.mutex.Lock()
 					currentState := b.state
 					b.mutex.Unlock()
 					
-					// Only disconnect if not in a ready or busy state
-					if currentState != BotStateReady && currentState != BotStateBusy {
-						LogWarning("Bot %s: Disconnecting due to event timeout in state: %s", b.account.Username, currentState)
-						
+					if currentState == BotStateReady {
+						// Bot is ready, no need for timeout
+						LogInfo("Bot %s: Will reconnect in %v (attempt %d)",
+							b.account.Username, b.reconnectDelay, b.reconnectAttempts)
+						eventTimeout = nil
+						continue
+					}
+					
+					// Check if GC is ready
+					b.mutex.Lock()
+					isReady := b.cs2Handler.IsReady()
+					currentState = b.state
+					b.mutex.Unlock()
+					
+					LogInfo("Bot %s: GC ready check - isReady: %v, current state: %s",
+						b.account.Username, isReady, currentState)
+					
+					if isReady && currentState != BotStateReady {
 						b.mutex.Lock()
-						// Clean up resources
+						b.state = BotStateReady
+						b.mutex.Unlock()
+						
+						LogInfo("Bot %s: Ready to handle requests", b.account.Username)
+						
+						// Disable the event timeout for ready bots
+						LogInfo("Bot %s: Event timeout disabled for ready bot", b.account.Username)
+						eventTimeout = nil
+						
+						// Signal that the bot is ready
+						select {
+						case readySignal <- true:
+							LogInfo("Bot %s: Sent ready signal to main event loop", b.account.Username)
+						default:
+							// Channel already has a value or is closed
+						}
+						
+						continue
+					} else if currentState == BotStateLoggedIn {
+						// Bot is logged in but GC is not ready yet, give it more time
+						LogInfo("Bot %s: Event timeout disabled for bot in state: %s",
+							b.account.Username, currentState)
+						eventTimeout = time.After(30 * time.Second)
+						continue
+					}
+					
+					// If we reach here, we need to reconnect
+					b.mutex.Lock()
+					if b.client != nil {
+						b.client.Disconnect()
+						b.client = nil
+					}
+					if b.cs2Handler != nil {
+						b.cs2Handler.Shutdown()
+						b.cs2Handler = nil
+					}
+					b.state = BotStateDisconnected
+					b.mutex.Unlock()
+					
+					// Break out of the event loop and try reconnecting
+					break
+					
+				case ready := <-readySignal:
+					if ready {
+						LogInfo("Bot %s: Received ready signal, disabling event timeout", b.account.Username)
+						eventTimeout = nil
+					} else {
+						// Bot disconnected or failed
+						b.mutex.Lock()
 						if b.client != nil {
 							b.client.Disconnect()
 							b.client = nil
@@ -487,47 +538,30 @@ func (b *Bot) connect() {
 						b.state = BotStateDisconnected
 						b.mutex.Unlock()
 						
-						// Break out of the event loop to trigger reconnect
-						break eventLoop
-					} else {
-						// If the bot is ready or busy, disable the timeout completely
-						LogInfo("Bot %s: Event timeout occurred but bot is in state %s, disabling timeout", 
-							b.account.Username, currentState)
-						eventTimeout = nil
+						// Break out of the event loop and try reconnecting
+						break
 					}
 					
 				case <-b.ctx.Done():
+					// Bot is shutting down
+					LogInfo("Bot %s: Event timeout occurred but bot is in state %s, disabling timeout",
+						b.account.Username, b.state)
+					
+					b.mutex.Lock()
+					if b.client != nil {
+						b.client.Disconnect()
+						b.client = nil
+					}
+					if b.cs2Handler != nil {
+						b.cs2Handler.Shutdown()
+						b.cs2Handler = nil
+					}
+					b.mutex.Unlock()
+					
 					LogInfo("Bot %s: Shutting down during event processing", b.account.Username)
 					return
 				}
 			}
-			
-			// If we get here, the event loop has ended, which means we're disconnected
-			b.mutex.Lock()
-			b.state = BotStateDisconnected
-			reconnectDelay := b.reconnectDelay
-			b.mutex.Unlock()
-			
-			// Wait before reconnecting
-			LogInfo("Bot %s: Waiting %v before reconnecting...", b.account.Username, reconnectDelay)
-			select {
-			case <-time.After(reconnectDelay):
-				// Time to reconnect
-			case <-b.ctx.Done():
-				LogInfo("Bot %s: Shutting down during reconnect wait", b.account.Username)
-				return
-			}
-			
-			// Clean up for next connection attempt
-			b.mutex.Lock()
-			if b.cs2Handler != nil {
-				b.cs2Handler.Shutdown()
-				b.cs2Handler = nil
-			}
-			if b.client != nil {
-				b.client = nil
-			}
-			b.mutex.Unlock()
 			
 		case <-connectionTimeout:
 			// Connection timed out
@@ -548,7 +582,7 @@ func (b *Bot) connect() {
 			
 			// Wait before retrying
 			reconnectDelay := b.calculateBackoff()
-			LogInfo("Bot %s: Waiting %v before retrying connection...", b.account.Username, reconnectDelay)
+			LogInfo("Bot %s: Waiting %v before reconnecting...", b.account.Username, reconnectDelay)
 			select {
 			case <-time.After(reconnectDelay):
 				// Time to retry
@@ -705,6 +739,32 @@ func loadAccounts() ([]Account, error) {
 				SharedSecret: parts[3],
 				ProxyIndex:   proxyIndex,
 			}
+			
+			// Try to load refresh token from session file
+			sessionDir := os.Getenv("SESSION_DIR")
+			if sessionDir == "" {
+				sessionDir = "sessions"
+			}
+			
+			sessionFile := filepath.Join(sessionDir, account.Username+".json")
+			
+			// Check if session file exists
+			if _, err := os.Stat(sessionFile); err == nil {
+				// Read session file
+				data, err := os.ReadFile(sessionFile)
+				if err == nil {
+					var session Session
+					if err := json.Unmarshal(data, &session); err == nil {
+						// Check if session is not too old (180 days)
+						ageInDays := float64(time.Now().UnixNano()/int64(time.Millisecond)-session.Timestamp) / (1000 * 60 * 60 * 24)
+						if ageInDays <= 180 && session.RefreshToken != "" {
+							account.RefreshToken = session.RefreshToken
+							LogInfo("Loaded refresh token for account %s", account.Username)
+						}
+					}
+				}
+			}
+			
 			accounts = append(accounts, account)
 			proxyIndex++
 		}
@@ -745,5 +805,139 @@ func ReleaseBot(bot *Bot) {
 func ShutdownBots() {
 	if botManager != nil {
 		botManager.Shutdown()
+	}
+}
+
+// loadSession loads the session data from disk if it exists
+func (b *Bot) loadSession() (*Session, error) {
+	// Create sessions directory if it doesn't exist
+	sessionDir := filepath.Dir(b.sessionFile)
+	if err := os.MkdirAll(sessionDir, 0755); err != nil {
+		return nil, err
+	}
+	
+	// Check if session file exists
+	if _, err := os.Stat(b.sessionFile); os.IsNotExist(err) {
+		LogInfo("Bot %s: No existing session found", b.account.Username)
+		return nil, nil
+	}
+	
+	// Read session file
+	data, err := os.ReadFile(b.sessionFile)
+	if err != nil {
+		LogInfo("Bot %s: Error reading session file: %v", b.account.Username, err)
+		return nil, err
+	}
+	
+	// Parse session data
+	var session Session
+	if err := json.Unmarshal(data, &session); err != nil {
+		LogInfo("Bot %s: Error parsing session data: %v", b.account.Username, err)
+		return nil, err
+	}
+	
+	// Check if session is too old (180 days)
+	ageInDays := float64(time.Now().UnixNano()/int64(time.Millisecond)-session.Timestamp) / (1000 * 60 * 60 * 24)
+	if ageInDays > 180 {
+		LogInfo("Bot %s: Session is too old (%.2f days), will create new one", b.account.Username, ageInDays)
+		return nil, nil
+	}
+	
+	LogInfo("Bot %s: Found existing session data", b.account.Username)
+	return &session, nil
+}
+
+// saveSession saves the current session data to disk
+func (b *Bot) saveSession() error {
+	// Don't save if no refresh token
+	if b.refreshToken == "" {
+		LogInfo("Bot %s: No refresh token available to save", b.account.Username)
+		return nil
+	}
+	
+	// Create session data
+	session := Session{
+		RefreshToken: b.refreshToken,
+		Timestamp:    time.Now().UnixNano() / int64(time.Millisecond),
+		Username:     b.account.Username,
+		HasGuard:     false, // Set based on Steam Guard status if available
+	}
+	
+	// Serialize session data
+	data, err := json.MarshalIndent(session, "", "  ")
+	if err != nil {
+		LogInfo("Bot %s: Error serializing session data: %v", b.account.Username, err)
+		return err
+	}
+	
+	// Create sessions directory if it doesn't exist
+	sessionDir := filepath.Dir(b.sessionFile)
+	if err := os.MkdirAll(sessionDir, 0755); err != nil {
+		LogInfo("Bot %s: Error creating sessions directory: %v", b.account.Username, err)
+		return err
+	}
+	
+	// Write session file
+	if err := os.WriteFile(b.sessionFile, data, 0644); err != nil {
+		LogInfo("Bot %s: Error writing session file: %v", b.account.Username, err)
+		return err
+	}
+	
+	LogInfo("Bot %s: Session saved successfully", b.account.Username)
+	return nil
+}
+
+// getProxyForBot returns a proxy string for the given bot
+func getProxyForBot(username string, proxyIndex int) string {
+	proxyStr := os.Getenv("PROXY_URL")
+	if proxyStr == "" {
+		return ""
+	}
+	
+	// Replace [session] with username + index
+	session := fmt.Sprintf("%s%d", username, proxyIndex)
+	proxyStr = strings.ReplaceAll(proxyStr, "[session]", session)
+	
+	return proxyStr
+} 
+
+// handleConnectionFailure handles a failed connection attempt
+func (b *Bot) handleConnectionFailure() {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	
+	// Clean up resources
+	if b.client != nil {
+		b.client.Disconnect()
+		b.client = nil
+	}
+	if b.cs2Handler != nil {
+		b.cs2Handler.Shutdown()
+		b.cs2Handler = nil
+	}
+	
+	// Update state
+	b.state = BotStateDisconnected
+	b.reconnectAttempts++
+	
+	// Calculate backoff
+	b.reconnectDelay = time.Duration(float64(b.reconnectDelay) * ReconnectBackoffFactor)
+	if b.reconnectDelay > MaxReconnectDelay {
+		b.reconnectDelay = MaxReconnectDelay
+	}
+}
+
+// UpdateRefreshToken updates the bot's refresh token and saves the session
+func (b *Bot) UpdateRefreshToken(token string) {
+	if token == "" {
+		return
+	}
+	
+	LogInfo("Bot %s: Updating refresh token", b.account.Username)
+	b.refreshToken = token
+	
+	// Save the session with the new refresh token
+	if err := b.saveSession(); err != nil {
+		LogError("Bot %s: Failed to save session: %v", b.account.Username, err)
 	}
 } 

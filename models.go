@@ -94,4 +94,13 @@ type Account struct {
 	SentryHash   string
 	SharedSecret string
 	ProxyIndex   int    // Index for proxy rotation
+	RefreshToken string // Steam refresh token for persistent sessions
+}
+
+// Session represents a stored Steam session with refresh token
+type Session struct {
+	RefreshToken string    `json:"refreshToken"`
+	Timestamp    int64     `json:"timestamp"`
+	Username     string    `json:"username"`
+	HasGuard     bool      `json:"hasGuard"`
 } 
