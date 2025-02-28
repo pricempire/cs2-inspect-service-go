@@ -89,8 +89,9 @@ type HealthResponse struct {
 
 // Account represents a Steam account
 type Account struct {
-	Username string
-	Password string
-	SentryHash string
+	Username     string
+	Password     string
+	SentryHash   string
 	SharedSecret string
+	ProxyIndex   int    // Index for proxy rotation
 } 
