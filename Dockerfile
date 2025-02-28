@@ -16,7 +16,7 @@ RUN go mod download
 COPY . .
 
 # Build the application
-RUN CGO_ENABLED=1 GOOS=linux go build -o cs2-inspect-service
+RUN CGO_ENABLED=1 GOOS=linux go build -o cs2-inspect-service -ldflags "-X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn"
 
 # Final stage
 FROM alpine:latest

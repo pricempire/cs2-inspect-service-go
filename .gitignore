@@ -3,3 +3,6 @@ accounts.txt
 #go-steam
 
 static/schema_*
+
+# build output
+cs2-inspect-service-go
