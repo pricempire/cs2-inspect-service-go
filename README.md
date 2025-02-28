@@ -105,68 +105,22 @@ A Go service for inspecting CS2 items using the Steam Game Coordinator. This ser
 4. Set up the PostgreSQL database:
 
    <details>
-   <summary>Database setup SQL</summary>
+   <summary>Database setup</summary>
 
-   ```sql
-   CREATE DATABASE cs2_inspect;
+   The SQL initialization script is located in the `sql/init.sql` file. You can run it using:
 
-   CREATE TABLE asset (
-       unique_id VARCHAR(64) NOT NULL,
-       asset_id BIGINT NOT NULL,
-       ms BIGINT NOT NULL,
-       d VARCHAR(32) NOT NULL,
-       paint_seed SMALLINT,
-       paint_index SMALLINT,
-       paint_wear DOUBLE PRECISION,
-       quality SMALLINT,
-       custom_name VARCHAR(64),
-       def_index SMALLINT,
-       origin SMALLINT,
-       rarity SMALLINT,
-       quest_id SMALLINT,
-       reason SMALLINT,
-       music_index SMALLINT,
-       ent_index SMALLINT,
-       is_stattrak BOOLEAN DEFAULT FALSE,
-       is_souvenir BOOLEAN DEFAULT FALSE,
-       stickers JSONB,
-       keychains JSONB,
-       killeater_score_type SMALLINT,
-       killeater_value INTEGER,
-       pet_index SMALLINT,
-       inventory BIGINT,
-       drop_reason SMALLINT,
-       created_at TIMESTAMP NOT NULL,
-       updated_at TIMESTAMP NOT NULL,
-       PRIMARY KEY (asset_id, ms, d)
-   );
-
-   CREATE INDEX asset_unique_id ON asset (unique_id);
-   CREATE INDEX asset_paint_details ON asset (paint_seed, paint_index, paint_wear);
-   CREATE INDEX asset_item_details ON asset (def_index, quality, rarity, origin);
-
-   CREATE TABLE history (
-       id SERIAL PRIMARY KEY,
-       unique_id VARCHAR(64) NOT NULL,
-       asset_id BIGINT NOT NULL,
-       prev_asset_id BIGINT,
-       owner VARCHAR(64) NOT NULL,
-       prev_owner VARCHAR(64),
-       d VARCHAR(32) NOT NULL,
-       stickers JSONB,
-       keychains JSONB,
-       prev_stickers JSONB,
-       prev_keychains JSONB,
-       type VARCHAR(32) NOT NULL,
-       created_at TIMESTAMP NOT NULL,
-       updated_at TIMESTAMP NOT NULL,
-       UNIQUE (asset_id, unique_id)
-   );
-
-   CREATE INDEX history_unique_id ON history (unique_id);
-   CREATE INDEX history_asset_id ON history (asset_id);
-   CREATE INDEX history_type ON history (type);
+   ```bash
+   psql -U postgres -f sql/init.sql
    ```
+
+   Or manually create the database and tables using the SQL commands in the file.
+
+   The script will:
+
+   - Create the `cs2_inspect` database
+   - Create the `asset` table for storing item information
+   - Create the `history` table for tracking item changes
+   - Set up appropriate indexes for performance optimization
 
    </details>
 
@@ -381,6 +335,30 @@ GET /history?uniqueId=abcd1234
 The service uses PostgreSQL to cache inspect results. When a request is made, the service first checks if the item is already in the database. If it is, the cached result is returned immediately. If not, the service fetches the item information from the Game Coordinator and then saves it to the database for future requests.
 
 This caching mechanism significantly improves performance for frequently requested items and reduces the load on the Steam Game Coordinator.
+
+### Float Ranking System
+
+The service includes a float ranking system that calculates and provides rankings for item float values. These rankings are stored in a materialized view called `rankings` and are updated periodically.
+
+The ranking system provides:
+
+- **Global rankings**: Where an item's float value ranks among all items in the database
+
+  - `global_low`: Rank among items with the highest float values (most battle-scarred)
+  - `global_high`: Rank among items with the lowest float values (most factory new)
+
+- **Item-specific rankings**: Where an item's float value ranks among similar items
+  - `low_rank`: Rank among items of the same type with the highest float values
+  - `high_rank`: Rank among items of the same type with the lowest float values
+
+Item-specific rankings are partitioned by:
+
+- Paint index (skin type)
+- Def index (weapon type)
+- StatTrak™ status
+- Souvenir status
+
+This allows users to see how rare an item's float value is compared to other similar items, which can be valuable information for collectors and traders.
 
 ## History Tracking
 
