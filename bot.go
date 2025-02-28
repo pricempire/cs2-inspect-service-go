@@ -13,6 +13,7 @@ import (
 	"time"
 
 	goSteam "github.com/Philipp15b/go-steam/v3"
+	"github.com/Philipp15b/go-steam/v3/protocol/steamlang"
 )
 
 // Constants for bot management
@@ -278,16 +279,43 @@ func NewBot(account Account, parentCtx context.Context) *Bot {
 // Start initializes and starts the bot
 func (b *Bot) Start() {
 	LogInfo("Starting bot %s", b.account.Username)
-	b.connect()
+	
+	// Try to connect, if it fails, retry with a different proxy
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		if b.connect() {
+			// Connection successful
+			return
+		}
+		
+		// If we've been blacklisted, don't retry
+		if isBlacklisted(b.account.Username) {
+			LogWarning("Bot %s: Account has been blacklisted, not retrying", b.account.Username)
+			return
+		}
+		
+		// If we've reached the maximum number of retries, give up
+		if i == maxRetries-1 {
+			LogWarning("Bot %s: Failed to connect after %d attempts", b.account.Username, maxRetries)
+			return
+		}
+		
+		// Increment the proxy index to try a different proxy
+		b.account.ProxyIndex++
+		LogInfo("Bot %s: Retrying connection with proxy index %d", b.account.Username, b.account.ProxyIndex)
+		
+		// Wait a bit before retrying
+		time.Sleep(time.Duration(5+rand.Intn(5)) * time.Second)
+	}
 }
 
 // connect establishes a connection to Steam
-func (b *Bot) connect() {
+func (b *Bot) connect() bool {
 	for {
 		select {
 		case <-b.ctx.Done():
 			LogInfo("Bot %s shutting down", b.account.Username)
-			return
+			return false
 		default:
 			// Continue with connection attempt
 		}
@@ -404,6 +432,52 @@ func (b *Bot) connect() {
 						// Send hello to GC
 						b.SendHello()
 						
+					case *goSteam.LogOnFailedEvent:
+						logonFailed := event.(*goSteam.LogOnFailedEvent)
+						LogError("Bot %s: Login failed with result: %v", b.account.Username, logonFailed.Result)
+						
+						// Handle specific login failure cases
+						switch logonFailed.Result {
+						case steamlang.EResult_InvalidPassword, steamlang.EResult_AccountLogonDenied, steamlang.EResult_IllegalPassword:
+							// Invalid credentials - blacklist the account
+							LogError("Bot %s: Invalid credentials. Blacklisting account.", b.account.Username)
+							if err := blacklistAccount(b.account.Username, BlacklistReasonCredentials); err != nil {
+								LogError("Bot %s: Failed to blacklist account: %v", b.account.Username, err)
+							}
+							
+						case steamlang.EResult_AccountLogonDeniedNoMail, steamlang.EResult_AccountLogonDeniedVerifiedEmailRequired,
+							steamlang.EResult_AccountLoginDeniedNeedTwoFactor, steamlang.EResult_TwoFactorCodeMismatch,
+							steamlang.EResult_TwoFactorActivationCodeMismatch:
+							// Steam Guard issues - blacklist the account
+							LogError("Bot %s: Steam Guard required or misconfigured. Blacklisting account.", b.account.Username)
+							if err := blacklistAccount(b.account.Username, BlacklistReasonSteamGuard); err != nil {
+								LogError("Bot %s: Failed to blacklist account: %v", b.account.Username, err)
+							}
+							
+						case steamlang.EResult_Banned, steamlang.EResult_AccountDisabled, steamlang.EResult_AccountLockedDown,
+							steamlang.EResult_Suspended, steamlang.EResult_AccountLimitExceeded:
+							// Account banned or disabled - blacklist the account
+							LogError("Bot %s: Account banned or disabled. Blacklisting account.", b.account.Username)
+							if err := blacklistAccount(b.account.Username, BlacklistReasonBanned); err != nil {
+								LogError("Bot %s: Failed to blacklist account: %v", b.account.Username, err)
+							}
+							
+						case steamlang.EResult_AccountLoginDeniedThrottle, steamlang.EResult_RateLimitExceeded:
+							// Rate limited - don't blacklist, just retry with different proxy
+							LogWarning("Bot %s: Login throttled. Will retry with different proxy.", b.account.Username)
+							
+						default:
+							// Other errors - log but don't blacklist
+							LogError("Bot %s: Login failed with unhandled result: %v", b.account.Username, logonFailed.Result)
+						}
+						
+						b.mutex.Lock()
+						b.state = BotStateDisconnected
+						b.mutex.Unlock()
+						
+						// Signal disconnection
+						return false
+						
 					case *goSteam.MachineAuthUpdateEvent:
 						// Handle Steam Guard
 						LogInfo("Bot %s: Received machine auth update", b.account.Username)
@@ -420,7 +494,7 @@ func (b *Bot) connect() {
 						
 						// Signal disconnection
 						close(readySignal)
-						return
+						return false
 					}
 					
 					// If we're fully connected and logged in, check if GC is ready
@@ -559,7 +633,7 @@ func (b *Bot) connect() {
 					b.mutex.Unlock()
 					
 					LogInfo("Bot %s: Shutting down during event processing", b.account.Username)
-					return
+					return false
 				}
 			}
 			
@@ -588,7 +662,7 @@ func (b *Bot) connect() {
 				// Time to retry
 				continue
 			case <-b.ctx.Done():
-				return
+				return false
 			}
 		}
 	}
@@ -611,8 +685,15 @@ func (b *Bot) calculateBackoff() time.Duration {
 }
 
 // Reconnect forces a reconnection of the bot
-func (b *Bot) Reconnect() {
+func (b *Bot) Reconnect() bool {
 	b.mutex.Lock()
+	
+	// Check if the account has been blacklisted
+	if isBlacklisted(b.account.Username) {
+		LogWarning("Bot %s: Account has been blacklisted, not reconnecting", b.account.Username)
+		b.mutex.Unlock()
+		return false
+	}
 	
 	LogInfo("Bot %s: Forcing reconnect from state: %s", b.account.Username, b.state)
 	
@@ -636,36 +717,40 @@ func (b *Bot) Reconnect() {
 		b.client = nil
 	}
 	
-	// Reset state and reconnection parameters
+	// Reset state
 	b.state = BotStateDisconnected
-	b.reconnectDelay = InitialReconnectDelay
-	b.reconnectAttempts = 0
-	
-	// Create a new client and handler
-	b.client = goSteam.NewClient()
-	
-	// Set up proxy if configured
-	proxyDialer, err := GetProxyForAccount(b.account.Username, b.account.ProxyIndex)
-	if err != nil {
-		LogWarning("Bot %s: Failed to set up proxy for reconnect: %v", b.account.Username, err)
-	} else if proxyDialer != nil {
-		LogInfo("Bot %s: Setting up proxy with index %d for reconnect", b.account.Username, b.account.ProxyIndex)
-		b.client.SetProxyDialer(&proxyDialer)
-	}
-	
-	b.cs2Handler = NewCS2Handler(b.client)
-	b.client.GC.RegisterPacketHandler(b.cs2Handler)
-	
-	// Release the lock before starting connection
 	b.mutex.Unlock()
 	
-	// Start a new connection in a goroutine
-	go func() {
-		LogInfo("Bot %s: Starting new connection after forced reconnect", b.account.Username)
-		// Small delay to ensure previous connection is fully closed
-		time.Sleep(2 * time.Second)
-		b.client.Connect()
-	}()
+	// Try to connect with a new client
+	// Try to connect, if it fails, retry with a different proxy
+	maxRetries := 3
+	for i := 0; i < maxRetries; i++ {
+		if b.connect() {
+			// Connection successful
+			return true
+		}
+		
+		// If we've been blacklisted during connection, don't retry
+		if isBlacklisted(b.account.Username) {
+			LogWarning("Bot %s: Account has been blacklisted during reconnect, not retrying", b.account.Username)
+			return false
+		}
+		
+		// If we've reached the maximum number of retries, give up
+		if i == maxRetries-1 {
+			LogWarning("Bot %s: Failed to reconnect after %d attempts", b.account.Username, maxRetries)
+			return false
+		}
+		
+		// Increment the proxy index to try a different proxy
+		b.account.ProxyIndex++
+		LogInfo("Bot %s: Retrying reconnection with proxy index %d", b.account.Username, b.account.ProxyIndex)
+		
+		// Wait a bit before retrying
+		time.Sleep(time.Duration(5+rand.Intn(5)) * time.Second)
+	}
+	
+	return false
 }
 
 // SendHello sends a hello message to the Game Coordinator
@@ -710,8 +795,158 @@ func (b *Bot) RequestItemInfo(paramA, paramD, paramS, paramM uint64) {
 	}
 }
 
+// BlacklistReason represents the reason an account was blacklisted
+type BlacklistReason int
+
+const (
+	BlacklistReasonUnknown     BlacklistReason = 0
+	BlacklistReasonBanned      BlacklistReason = 1
+	BlacklistReasonSteamGuard  BlacklistReason = 2
+	BlacklistReasonCredentials BlacklistReason = 3
+)
+
+// BlacklistedAccount represents an account that has been blacklisted
+type BlacklistedAccount struct {
+	Username string
+	Reason   BlacklistReason
+	Time     time.Time
+}
+
+var (
+	// Global blacklist of accounts
+	blacklistedAccounts = make(map[string]BlacklistedAccount)
+	blacklistMutex      sync.RWMutex
+)
+
+// loadBlacklist loads blacklisted accounts from the blacklist file
+func loadBlacklist() error {
+	blacklistPath := os.Getenv("BLACKLIST_PATH")
+	if blacklistPath == "" {
+		blacklistPath = "blacklist.txt"
+	}
+
+	// Check if blacklist file exists
+	if _, err := os.Stat(blacklistPath); os.IsNotExist(err) {
+		LogInfo("Blacklist file does not exist: %s", blacklistPath)
+		return nil
+	}
+
+	file, err := os.Open(blacklistPath)
+	if err != nil {
+		return fmt.Errorf("failed to open blacklist file: %v", err)
+	}
+	defer file.Close()
+
+	blacklistMutex.Lock()
+	defer blacklistMutex.Unlock()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ":")
+		if len(parts) >= 2 {
+			username := parts[0]
+			reasonStr := parts[1]
+			
+			var reason BlacklistReason
+			switch reasonStr {
+			case "banned":
+				reason = BlacklistReasonBanned
+			case "steamguard":
+				reason = BlacklistReasonSteamGuard
+			case "credentials":
+				reason = BlacklistReasonCredentials
+			default:
+				reason = BlacklistReasonUnknown
+			}
+			
+			blacklistedAccounts[username] = BlacklistedAccount{
+				Username: username,
+				Reason:   reason,
+				Time:     time.Now(), // We don't have the original time, so use current time
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("error reading blacklist file: %v", err)
+	}
+
+	LogInfo("Loaded %d blacklisted accounts", len(blacklistedAccounts))
+	return nil
+}
+
+// saveBlacklist saves the blacklisted accounts to the blacklist file
+func saveBlacklist() error {
+	blacklistPath := os.Getenv("BLACKLIST_PATH")
+	if blacklistPath == "" {
+		blacklistPath = "blacklist.txt"
+	}
+
+	file, err := os.Create(blacklistPath)
+	if err != nil {
+		return fmt.Errorf("failed to create blacklist file: %v", err)
+	}
+	defer file.Close()
+
+	blacklistMutex.RLock()
+	defer blacklistMutex.RUnlock()
+
+	for _, account := range blacklistedAccounts {
+		var reasonStr string
+		switch account.Reason {
+		case BlacklistReasonBanned:
+			reasonStr = "banned"
+		case BlacklistReasonSteamGuard:
+			reasonStr = "steamguard"
+		case BlacklistReasonCredentials:
+			reasonStr = "credentials"
+		default:
+			reasonStr = "unknown"
+		}
+		
+		_, err := fmt.Fprintf(file, "%s:%s\n", account.Username, reasonStr)
+		if err != nil {
+			return fmt.Errorf("error writing to blacklist file: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// blacklistAccount adds an account to the blacklist
+func blacklistAccount(username string, reason BlacklistReason) error {
+	blacklistMutex.Lock()
+	defer blacklistMutex.Unlock()
+
+	blacklistedAccounts[username] = BlacklistedAccount{
+		Username: username,
+		Reason:   reason,
+		Time:     time.Now(),
+	}
+
+	LogWarning("Account %s has been blacklisted. Reason: %d", username, reason)
+	
+	// Save the updated blacklist
+	return saveBlacklist()
+}
+
+// isBlacklisted checks if an account is blacklisted
+func isBlacklisted(username string) bool {
+	blacklistMutex.RLock()
+	defer blacklistMutex.RUnlock()
+	
+	_, exists := blacklistedAccounts[username]
+	return exists
+}
+
 // loadAccounts loads Steam accounts from accounts.txt or the file specified in ACCOUNTS_FILE env var
 func loadAccounts() ([]Account, error) {
+	// Load blacklist first
+	if err := loadBlacklist(); err != nil {
+		LogWarning("Failed to load blacklist: %v", err)
+	}
+	
 	// Get accounts file from env or use default
 	accountsFile := os.Getenv("ACCOUNTS_FILE")
 	if accountsFile == "" {
@@ -732,8 +967,16 @@ func loadAccounts() ([]Account, error) {
 		line := scanner.Text()
 		parts := strings.Split(line, ":")
 		if len(parts) >= 4 {
+			username := parts[0]
+			
+			// Skip blacklisted accounts
+			if isBlacklisted(username) {
+				LogInfo("Skipping blacklisted account: %s", username)
+				continue
+			}
+			
 			account := Account{
-				Username:     parts[0],
+				Username:     username,
 				Password:     parts[1],
 				SentryHash:   parts[2],
 				SharedSecret: parts[3],
@@ -743,7 +986,10 @@ func loadAccounts() ([]Account, error) {
 			// Try to load refresh token from session file
 			sessionDir := os.Getenv("SESSION_DIR")
 			if sessionDir == "" {
-				sessionDir = "sessions"
+				sessionDir = os.Getenv("SESSION_FOLDER")
+				if sessionDir == "" {
+					sessionDir = "sessions"
+				}
 			}
 			
 			sessionFile := filepath.Join(sessionDir, account.Username+".json")
@@ -774,6 +1020,7 @@ func loadAccounts() ([]Account, error) {
 		return nil, err
 	}
 
+	LogInfo("Loaded %d accounts (excluded %d blacklisted accounts)", len(accounts), len(blacklistedAccounts))
 	return accounts, nil
 }
 

@@ -114,6 +114,8 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	reconnectedCount := 0
+	failedCount := 0
+	blacklistedCount := 0
 	
 	botManager.mutex.RLock()
 	defer botManager.mutex.RUnlock()
@@ -127,13 +129,23 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 				botState := bot.state
 				bot.mutex.Unlock()
 				
+				// Check if the account is blacklisted
+				if isBlacklisted(botUsername) {
+					LogWarning("Manual reconnect requested for blacklisted bot: %s", botUsername)
+					blacklistedCount++
+					continue
+				}
+				
 				LogInfo("Manual reconnect triggered for bot: %s (current state: %s, force: %v)", 
 					botUsername, botState, forceRestart)
 				
 				// If force restart is requested, completely restart the bot
 				if forceRestart {
+					// Use a channel to get the result of the reconnect
+					resultChan := make(chan bool, 1)
+					
 					// Start reconnect in a goroutine to avoid blocking the HTTP response
-					go func(b *Bot) {
+					go func(b *Bot, ch chan<- bool) {
 						// First try to gracefully disconnect
 						b.mutex.Lock()
 						if b.cs2Handler != nil {
@@ -145,14 +157,34 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 						time.Sleep(1 * time.Second)
 						
 						// Then force a complete reconnect
-						b.Reconnect()
-					}(bot)
+						success := b.Reconnect()
+						ch <- success
+					}(bot, resultChan)
+					
+					// Wait for the result with a timeout
+					select {
+					case success := <-resultChan:
+						if success {
+							reconnectedCount++
+						} else {
+							failedCount++
+						}
+					case <-time.After(2 * time.Second):
+						// Don't wait for the result, just assume it's in progress
+						LogInfo("Reconnect for bot %s is in progress", botUsername)
+						reconnectedCount++
+					}
 				} else {
 					// Standard reconnect
-					go bot.Reconnect()
+					go func(b *Bot) {
+						if b.Reconnect() {
+							LogInfo("Bot %s reconnected successfully", b.account.Username)
+						} else {
+							LogWarning("Bot %s failed to reconnect", b.account.Username)
+						}
+					}(bot)
+					reconnectedCount++
 				}
-				
-				reconnectedCount++
 				break
 			} else {
 				bot.mutex.Unlock()
@@ -165,6 +197,13 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 			botUsername := bot.account.Username
 			botState := bot.state
 			bot.mutex.Unlock()
+			
+			// Check if the account is blacklisted
+			if isBlacklisted(botUsername) {
+				LogWarning("Skipping reconnect for blacklisted bot: %s", botUsername)
+				blacklistedCount++
+				continue
+			}
 			
 			LogInfo("Manual reconnect triggered for bot: %s (current state: %s, force: %v)", 
 				botUsername, botState, forceRestart)
@@ -187,16 +226,30 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 				}
 				
 				// Then force a complete reconnect
-				b.Reconnect()
+				if b.Reconnect() {
+					LogInfo("Bot %s reconnected successfully", b.account.Username)
+				} else {
+					LogWarning("Bot %s failed to reconnect", b.account.Username)
+				}
 			}(bot)
 			
 			reconnectedCount++
 		}
 	}
 	
+	// Prepare response message
+	message := fmt.Sprintf("Reconnect triggered for %d bots", reconnectedCount)
+	if failedCount > 0 {
+		message += fmt.Sprintf(", %d failed", failedCount)
+	}
+	if blacklistedCount > 0 {
+		message += fmt.Sprintf(", %d blacklisted", blacklistedCount)
+	}
+	message += fmt.Sprintf(" (force: %v)", forceRestart)
+	
 	// Send response
 	sendJSONResponse(w, ReconnectResponse{
-		Success: true,
-		Message: fmt.Sprintf("Reconnect triggered for %d bots (force: %v)", reconnectedCount, forceRestart),
+		Success: reconnectedCount > 0,
+		Message: message,
 	})
 } 
