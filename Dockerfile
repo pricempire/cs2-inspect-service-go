@@ -29,12 +29,11 @@ RUN apk add --no-cache ca-certificates tzdata
 # Copy the binary from builder
 COPY --from=builder /app/cs2-inspect-service .
 
-# Copy config files
-COPY accounts.txt .
-COPY .env .
-
 # Create directory for session files
 RUN mkdir -p sessions
+
+# Create directory for logs
+RUN mkdir -p logs
 
 # Expose port
 EXPOSE 3000
