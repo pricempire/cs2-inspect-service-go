@@ -80,7 +80,9 @@ func main() {
 	
 	// Set up HTTP server routes
 	http.HandleFunc("/inspect", handleInspect)
+	http.HandleFunc("/float", handleInspect)
 	http.HandleFunc("/", handleInspect)
+	
 	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/reconnect", handleReconnect)
 	http.HandleFunc("/history", handleHistory)
