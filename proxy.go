@@ -36,8 +36,6 @@ func GetProxyForAccount(username string, index int) (proxy.Dialer, error) {
 	session := fmt.Sprintf("%s%d", username, index)
 	proxyStr = strings.ReplaceAll(proxyStr, "[session]", session)
 
-	LogInfo("Using proxy for %s: %s", username, proxyStr)
-
 	// Parse the proxy URL
 	proxyURL, err := url.Parse(proxyStr)
 	if err != nil {
