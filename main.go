@@ -59,8 +59,12 @@ func main() {
 	// Register shutdown handler
 	defer ShutdownBots()
 
-	// Set up HTTP server
+	// Serve static files from the html directory
+	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("html/static"))))
+	
+	// Set up HTTP server routes
 	http.HandleFunc("/inspect", handleInspect)
+	http.HandleFunc("/", handleInspect)
 	http.HandleFunc("/health", handleHealth)
 	http.HandleFunc("/reconnect", handleReconnect)
 	http.HandleFunc("/history", handleHistory)

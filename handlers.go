@@ -36,10 +36,8 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 	// Get the inspect link from the query string
 	inspectLink := r.URL.Query().Get("link")
 	if inspectLink == "" {
-		sendJSONResponse(w, InspectResponse{
-			Success: false,
-			Error:   "Missing inspect link",
-		})
+		// If no link is provided, serve the HTML documentation page
+		http.ServeFile(w, r, "html/index.html")
 		return
 	}
 

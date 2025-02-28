@@ -1,0 +1,169 @@
+  <html>
+            <head>
+                <title>CS2 Inspect API Documentation</title>
+                <link rel="stylesheet" href="/static/css/styles.css">
+                <script src="/static/js/app.js"></script>
+            </head>
+            <body>
+                <a href="https://pricempire.com/"> 
+                    <img src="/static/logo.svg" alt="Pricempire Logo" style="width: 200px; height: 100px;">
+                </a>
+                <h1>CS2 Inspect API</h1>
+                <p>Welcome to the CS2 Inspect API service. This API provides real-time inspection data for CS2 items including float values, pattern indexes, and sticker information.</p>
+                
+                <a href="https://github.com/pricempire/cs2-inspect-service" class="github-link" target="_blank">
+                    <svg viewBox="0 0 16 16" fill="currentColor">
+                        <path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path>
+                    </svg>
+                    View on GitHub
+                </a>
+
+                <div>
+                    <h2>Test</h2>
+                    <form id="inspectForm" action="/inspect" method="get" onsubmit="return validateForm(event)">
+                        <div style="flex-direction: column; flex: 1;">
+                            <input 
+                                type="text" 
+                                name="url" 
+                                id="inspectLink"
+                                placeholder="Steam inspect link" 
+                            />
+                            <div id="errorMessage" class="error-message">
+                                Please enter a valid CS2 inspect link (steam://rungame/...)
+                            </div>
+                        </div>
+                        <button type="submit">Inspect</button>
+                    </form>
+                </div>
+
+                <script>
+                    function validateForm(event) {
+                        event.preventDefault();
+                        
+                        const input = document.getElementById('inspectLink');
+                        const errorMessage = document.getElementById('errorMessage');
+                        const value = input.value.trim();
+
+                        // Reset previous error state
+                        input.classList.remove('error');
+                        errorMessage.style.display = 'none';
+
+                        // Check if empty
+                        if (!value) {
+                            showError('Please enter an inspect link');
+                            return false;
+                        }
+
+                        // Validate steam inspect URL format
+                        const steamUrlPattern = /^(?:steam:\/\/rungame\/730\/|https?:\/\/(?:www\.)?steamcommunity\.com\/market\/listings\/730\/.*[?&]inspectlink=steam:\/\/rungame\/730\/)/i;
+                        
+                        // Check for S, A, D, M parameters format
+                        const paramPattern = /[?&](?:s=\d+&a=\d+&d=\d+&m=\d+|[SADM]=\d+)/i;
+
+                        if (!steamUrlPattern.test(value) && !paramPattern.test(value)) {
+                            showError('Please enter a valid CS2 inspect link');
+                            return false;
+                        }
+
+                        // If validation passes, manually submit the form
+                        window.location.href = `/inspect?link=${encodeURIComponent(value)}`;
+                        return true;
+                    }
+
+                    function showError(message) {
+                        const input = document.getElementById('inspectLink');
+                        const errorMessage = document.getElementById('errorMessage');
+                        
+                        input.classList.add('error');
+                        errorMessage.textContent = message;
+                        errorMessage.style.display = 'block';
+                        
+                        return false;
+                    }
+
+                    // Update the input event listener to not trigger form submission
+                    document.getElementById('inspectLink').addEventListener('input', function() {
+                        const errorMessage = document.getElementById('errorMessage');
+                        if (!this.value.trim()) {
+                            this.classList.remove('error');
+                            errorMessage.style.display = 'none';
+                        }
+                    });
+                </script>
+
+                <div class="endpoint">
+                    <h2>Endpoints</h2>
+                    
+                    <h3>GET /inspect</h3> 
+                    <p>Inspect a CS2 item using various input methods.</p>
+
+                    <h4>Query Parameters:</h4>
+                    <ul>
+                        <li><code>link</code> - Steam inspect link</li>
+                        <li><code>s</code> - param S from inspect link</li>
+                        <li><code>a</code> - param A from inspect link</li>
+                        <li><code>d</code> - param D from inspect link</li>
+                        <li><code>m</code> - param M from inspect link</li>
+                        <li><code>refresh</code> - (optional) Set to true to refresh sticker data (if enabled)</li>
+                    </ul>
+
+                    <div class="example">
+                        <h4>Example Requests:</h4>
+                        <pre>GET /inspect?url=steam://rungame/730/76561202255233023/+csgo_econ_action_preview%20S76561198023809011A40368145941D14586214085613790969</pre>
+                        <pre>GET /inspect?s=76561198023809011&a=40368145941&d=14586214085613790969</pre>
+                    </div>
+
+                    <div class="example">
+                        <h4>Example Response:</h4>
+                        <pre>
+{
+    "iteminfo": {
+        "defindex": 16,
+        "paintindex": 309,
+        "rarity": 7,
+        "quality": 4,
+        "origin": 8,
+        "floatvalue": 0.1572919487953186,
+        "paintseed": 826,
+        "wear_name": "Field-Tested",
+        "market_hash_name": "M4A4 | Howl (Field-Tested)",
+        "stickers": [
+            {
+                "slot": 3,
+                "wear": 0.11459143459796906,
+                "scale": null,
+                "pattern": null,
+                "tint_id": null,
+                "offset_x": null,
+                "offset_y": null,
+                "offset_z": null,
+                "rotation": null,
+                "sticker_id": 202,
+                "market_hash_name": "Sticker | Cloud9 (Holo) | DreamHack 2014"
+            }
+        ],
+        "keychains": [
+            {
+                "slot": 0,
+                "wear": null,
+                "scale": null,
+                "pattern": 22820,
+                "tint_id": null,
+                "offset_x": 10.525607109069824,
+                "offset_y": 0.578781008720398,
+                "offset_z": 12.312423706054688,
+                "rotation": null,
+                "sticker_id": 19,
+                "market_hash_name": "Charm | Pocket AWP"
+            }
+        ],
+        "image": "https://community.cloudflare.steamstatic.com/economy/image/-9a81dlWLwJ2UUGcVs_nsVtzdOEdtWwKGZZLQHTxDZ7I56KU0Zwwo4NUX4oFJZEHLbXH5ApeO4YmlhxYQknCRvCo04DEVlxkKgpou-6kejhjxszFJTwT09S5g4yCmfDLP7LWnn8f6pIl2-yYp9SnjA23-BBuNW-iLI-XJgFsZQyG_VW2lOq918e8uszLn2wj5HeAvkVdtQ",
+        "type": "Weapon",
+        "souvenir": false,
+        "stattrak": false
+    }
+}</pre>
+                    </div>
+                </div>  
+            </body>
+            </html>
