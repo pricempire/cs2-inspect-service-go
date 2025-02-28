@@ -84,7 +84,43 @@ type BotStatus struct {
 // HealthResponse represents the response from the health check
 type HealthResponse struct {
 	Status string      `json:"status"`
-	Bots   []BotStatus `json:"bots"`
+	Uptime string      `json:"uptime"`
+	Bots   BotStats    `json:"bots"`
+	Metrics MetricsStats `json:"metrics"`
+	Requests RequestStats `json:"requests"`
+}
+
+// BotStats represents statistics about the bots
+type BotStats struct {
+	Ready        int     `json:"ready"`
+	Busy         int     `json:"busy"`
+	Cooldown     int     `json:"cooldown"`
+	Disconnected int     `json:"disconnected"`
+	Error        int     `json:"error"`
+	Initializing int     `json:"initializing"`
+	Total        int     `json:"total"`
+	Utilization  string  `json:"utilization"`
+}
+
+// MetricsStats represents success/failure metrics
+type MetricsStats struct {
+	Success MetricStat `json:"success"`
+	Cached  MetricStat `json:"cached"`
+	Failed  MetricStat `json:"failed"`
+	Timeouts MetricStat `json:"timeouts"`
+	Total   int        `json:"total"`
+}
+
+// MetricStat represents a single metric with rate and count
+type MetricStat struct {
+	Rate  string `json:"rate"`
+	Count int    `json:"count"`
+}
+
+// RequestStats represents request statistics
+type RequestStats struct {
+	Current int     `json:"current"`
+	Average string  `json:"average"`
 }
 
 // Account represents a Steam account

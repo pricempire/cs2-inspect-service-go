@@ -10,6 +10,17 @@ import (
 	"github.com/joho/godotenv"
 )
 
+// Global variables for tracking metrics
+var (
+	startTime      = time.Now()
+	successCount   = 0
+	cachedCount    = 0
+	failedCount    = 0
+	timeoutCount   = 0
+	currentRequests = 0
+	requestHistory = make([]int, 0, 60) // Store last 60 seconds of request counts
+)
+
 // ReconnectResponse represents the response from the reconnect request
 type ReconnectResponse struct {
 	Success bool   `json:"success"`
@@ -61,6 +72,9 @@ func main() {
 	// Register shutdown handler
 	defer ShutdownBots()
 
+	// Start metrics collection
+	go collectMetrics()
+
 	// Serve static files from the html directory
 	http.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.Dir("html/static"))))
 	
@@ -76,6 +90,26 @@ func main() {
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		LogError("Failed to start HTTP server: %v", err)
 		os.Exit(1)
+	}
+}
+
+// collectMetrics collects request metrics every second
+func collectMetrics() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			// Add current request count to history
+			requestHistory = append(requestHistory, currentRequests)
+			currentRequests = 0
+			
+			// Keep only the last 60 seconds
+			if len(requestHistory) > 60 {
+				requestHistory = requestHistory[len(requestHistory)-60:]
+			}
+		}
 	}
 }
 

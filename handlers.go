@@ -16,6 +16,9 @@ import (
 
 // handleInspect handles the inspect request
 func handleInspect(w http.ResponseWriter, r *http.Request) {
+	// Increment current requests counter for metrics
+	currentRequests++
+	
 	// Set CORS headers
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
@@ -54,6 +57,8 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 			Success: false,
 			Error:   fmt.Sprintf("Invalid inspect link: %v", err),
 		})
+		// Increment failed count for metrics
+		failedCount++
 		return
 	}
 
@@ -123,6 +128,9 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 			
 			// Apply schema information to cached items
 			applySchemaToItemInfo(itemInfo)
+			
+			// Increment cached count for metrics
+			cachedCount++
 			
 			// Return the cached response
 			sendJSONResponse(w, InspectResponse{
@@ -203,6 +211,8 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 				Data:    responseData,
 				Error:   fmt.Sprintf("Received response but couldn't extract item info: %v", err),
 			})
+			// Increment success count for metrics (we got a response, even if we couldn't parse it)
+			successCount++
 			return
 		}
 		
@@ -385,6 +395,9 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		
+		// Increment success count for metrics
+		successCount++
+		
 		// Return the successful response with item info
 		sendJSONResponse(w, InspectResponse{
 			Success:  true,
@@ -400,6 +413,9 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 		
 		// Force a reconnect of the bot
 		bot.Reconnect()
+		
+		// Increment timeout count for metrics
+		timeoutCount++
 		
 		sendJSONResponse(w, InspectResponse{
 			Success: false,
@@ -624,7 +640,28 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(HealthResponse{
 			Status: "unhealthy",
-			Bots:   []BotStatus{},
+			Uptime: "0s",
+			Bots: BotStats{
+				Ready: 0,
+				Busy: 0,
+				Cooldown: 0,
+				Disconnected: 0,
+				Error: 0,
+				Initializing: 0,
+				Total: 0,
+				Utilization: "0.00%",
+			},
+			Metrics: MetricsStats{
+				Success: MetricStat{Rate: "0.00%", Count: 0},
+				Cached: MetricStat{Rate: "0.00%", Count: 0},
+				Failed: MetricStat{Rate: "0.00%", Count: 0},
+				Timeouts: MetricStat{Rate: "0.00%", Count: 0},
+				Total: 0,
+			},
+			Requests: RequestStats{
+				Current: 0,
+				Average: "0",
+			},
 		})
 		return
 	}
@@ -633,6 +670,12 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	botStatuses := make([]BotStatus, 0, len(botManager.bots))
 	
 	readyCount := 0
+	busyCount := 0
+	cooldownCount := 0
+	disconnectedCount := 0
+	errorCount := 0
+	initializingCount := 0
+	
 	for _, bot := range botManager.bots {
 		bot.mutex.Lock()
 		status := BotStatus{
@@ -646,11 +689,72 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		
 		botStatuses = append(botStatuses, status)
 		
+		// Count bots in each state
+		if status.Busy {
+			busyCount++
+		}
 		if status.Ready {
 			readyCount++
 		}
+		
+		// Count other states based on bot.state
+		switch bot.state {
+		case BotStateDisconnected:
+			disconnectedCount++
+		case BotStateConnecting:
+			initializingCount++
+		case BotStateLoggingIn:
+			initializingCount++
+		}
 	}
 	botManager.mutex.RUnlock()
+	
+	// Calculate utilization
+	totalBots := len(botManager.bots)
+	utilization := "0.00%"
+	if totalBots > 0 {
+		utilizationValue := float64(busyCount) / float64(totalBots) * 100
+		utilization = fmt.Sprintf("%.2f%%", utilizationValue)
+	}
+	
+	// Create BotStats
+	botStats := BotStats{
+		Ready:        readyCount,
+		Busy:         busyCount,
+		Cooldown:     cooldownCount,
+		Disconnected: disconnectedCount,
+		Error:        errorCount,
+		Initializing: initializingCount,
+		Total:        totalBots,
+		Utilization:  utilization,
+	}
+	
+	// Calculate metrics
+	totalRequests := successCount + cachedCount + failedCount + timeoutCount
+	
+	successRate := "0.00%"
+	cachedRate := "0.00%"
+	failedRate := "0.00%"
+	timeoutRate := "0.00%"
+	
+	if totalRequests > 0 {
+		successRate = fmt.Sprintf("%.2f%%", float64(successCount)/float64(totalRequests)*100)
+		cachedRate = fmt.Sprintf("%.2f%%", float64(cachedCount)/float64(totalRequests)*100)
+		failedRate = fmt.Sprintf("%.2f%%", float64(failedCount)/float64(totalRequests)*100)
+		timeoutRate = fmt.Sprintf("%.2f%%", float64(timeoutCount)/float64(totalRequests)*100)
+	}
+	
+	// Calculate request stats
+	currentReqs := currentRequests
+	avgReqs := 0
+	
+	if len(requestHistory) > 0 {
+		sum := 0
+		for _, count := range requestHistory {
+			sum += count
+		}
+		avgReqs = sum / len(requestHistory)
+	}
 	
 	// Determine overall status
 	status := "healthy"
@@ -660,11 +764,38 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		status = "degraded"
 	}
 	
+	// Calculate uptime
+	uptime := time.Since(startTime).String()
+	
 	// Send response
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(HealthResponse{
 		Status: status,
-		Bots:   botStatuses,
+		Uptime: uptime,
+		Bots:   botStats,
+		Metrics: MetricsStats{
+			Success: MetricStat{
+				Rate:  successRate,
+				Count: successCount,
+			},
+			Cached: MetricStat{
+				Rate:  cachedRate,
+				Count: cachedCount,
+			},
+			Failed: MetricStat{
+				Rate:  failedRate,
+				Count: failedCount,
+			},
+			Timeouts: MetricStat{
+				Rate:  timeoutRate,
+				Count: timeoutCount,
+			},
+			Total: totalRequests,
+		},
+		Requests: RequestStats{
+			Current: currentReqs,
+			Average: fmt.Sprintf("%d", avgReqs),
+		},
 	})
 }
 
