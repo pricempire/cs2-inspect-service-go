@@ -380,9 +380,19 @@ func (b *Bot) connect() bool {
 			// Channel to signal when the bot becomes ready
 			readySignal := make(chan bool, 1)
 			
-			eventTimeout := time.After(60 * time.Second)
+			// Create a timer for event timeout
+			eventTimeoutTimer := time.NewTimer(60 * time.Second)
+			timeoutActive := true
 			
 			for {
+				// If timeout is not active, drain the channel if needed and stop the timer
+				if !timeoutActive && !eventTimeoutTimer.Stop() {
+					select {
+					case <-eventTimeoutTimer.C:
+					default:
+					}
+				}
+				
 				select {
 				case event := <-b.client.Events():
 					switch event.(type) {
@@ -417,7 +427,7 @@ func (b *Bot) connect() bool {
 						b.client.Auth.LogOn(loginDetails)
 						
 						// Reset the event timeout after connecting
-						eventTimeout = time.After(60 * time.Second)
+						eventTimeoutTimer.Reset(60 * time.Second)
 						
 					case *goSteam.LoggedOnEvent:
 						LogInfo("Bot %s: Logged on to Steam", b.account.Username)
@@ -523,11 +533,11 @@ func (b *Bot) connect() bool {
 							}
 							
 							// Disable the event timeout
-							eventTimeout = nil
+							timeoutActive = false
 						}
 					}
 					
-				case <-eventTimeout:
+				case <-eventTimeoutTimer.C:
 					// Event timeout occurred
 					b.mutex.Lock()
 					currentState := b.state
@@ -537,13 +547,13 @@ func (b *Bot) connect() bool {
 						// Bot is ready, no need for timeout
 						LogInfo("Bot %s: Will reconnect in %v (attempt %d)",
 							b.account.Username, b.reconnectDelay, b.reconnectAttempts)
-						eventTimeout = nil
+						timeoutActive = false
 						continue
 					}
 					
 					// Check if GC is ready
 					b.mutex.Lock()
-					isReady := b.cs2Handler.IsReady()
+					isReady := b.cs2Handler != nil && b.cs2Handler.IsReady()
 					currentState = b.state
 					b.mutex.Unlock()
 					
@@ -559,7 +569,7 @@ func (b *Bot) connect() bool {
 						
 						// Disable the event timeout for ready bots
 						LogInfo("Bot %s: Event timeout disabled for ready bot", b.account.Username)
-						eventTimeout = nil
+						timeoutActive = false
 						
 						// Signal that the bot is ready
 						select {
@@ -572,9 +582,10 @@ func (b *Bot) connect() bool {
 						continue
 					} else if currentState == BotStateLoggedIn {
 						// Bot is logged in but GC is not ready yet, give it more time
-						LogInfo("Bot %s: Event timeout disabled for bot in state: %s",
+						LogInfo("Bot %s: Resetting event timeout for bot in state: %s",
 							b.account.Username, currentState)
-						eventTimeout = time.After(30 * time.Second)
+						eventTimeoutTimer.Reset(30 * time.Second)
+						timeoutActive = true
 						continue
 					}
 					
@@ -597,7 +608,7 @@ func (b *Bot) connect() bool {
 				case ready := <-readySignal:
 					if ready {
 						LogInfo("Bot %s: Received ready signal, disabling event timeout", b.account.Username)
-						eventTimeout = nil
+						timeoutActive = false
 					} else {
 						// Bot disconnected or failed
 						b.mutex.Lock()
