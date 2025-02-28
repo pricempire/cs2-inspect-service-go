@@ -15,6 +15,13 @@ A Go service for inspecting CS2 items using the Steam Game Coordinator. This ser
 - Float value ranking system
 - Detailed wear information including min/max values
 - Support for special patterns (Case Hardened, Fade, Marble Fade, Doppler phases)
+- SOCKS5 proxy support for bot connections
+- Web interface for testing and API documentation
+
+## Links
+
+- [Pricempire](https://pricempire.com/) - CS2 price comparison platform
+- [GitHub Repository](https://github.com/pricempire/cs2-inspect-service-go) - Source code and documentation
 
 ## Setup
 
@@ -23,6 +30,7 @@ A Go service for inspecting CS2 items using the Steam Game Coordinator. This ser
 - Go 1.18 or higher
 - PostgreSQL database
 - Steam accounts with CS2 access
+- (Optional) SOCKS5 proxies for bot connections
 
 ### Installation
 
@@ -67,6 +75,10 @@ A Go service for inspecting CS2 items using the Steam Game Coordinator. This ser
    REQUEST_TIMEOUT=30s
    BOT_RECONNECT_INTERVAL=5m
    MAX_CONCURRENT_REQUESTS=10
+
+   # Proxy configuration (optional)
+   # PROXY_ENABLED=true
+   # PROXY_URL=socks5://username:password@proxy.example.com:1080
    ```
 
    </details>
@@ -79,6 +91,13 @@ A Go service for inspecting CS2 items using the Steam Game Coordinator. This ser
    ```
    username:password
    username2:password2
+   ```
+
+   For accounts with proxies, you can specify them per account:
+
+   ```
+   username:password:socks5://proxy.example.com:1080
+   username2:password2:socks5://proxy2.example.com:1080
    ```
 
    </details>
@@ -187,6 +206,7 @@ GET /inspect?link=steam://rungame/730/...
 Optional parameters:
 
 - `refresh=true` - Force a refresh from the Game Coordinator instead of using cached data
+- `force=true` - Force reconnect the bot to the Game Coordinator before processing the request
 
 **Response:**
 
@@ -534,48 +554,44 @@ Example:
 
 </details>
 
-## Using the service
+## Web Interface
 
-<details>
-<summary>Example usage</summary>
+The service includes a web interface for testing the API and viewing documentation. When you access the root URL of the service without any parameters, it will serve an HTML page with:
 
-### Basic usage
+- A form for submitting inspect links
+- Option to force reconnect the bot to the Game Coordinator
+- API documentation
+- Visual and JSON views of inspection results
 
-```bash
-# Start the service
-go run .
+The web interface is accessible at the root URL of the service (e.g., `http://localhost:3000/`).
 
-# Or with protobuf warning suppression
-GOLANG_PROTOBUF_REGISTRATION_CONFLICT=warn go run .
-```
+## Proxy Support
 
-### Docker usage
+The service supports using SOCKS5 proxies for bot connections to Steam. This can be useful to:
 
-```bash
-# Build the Docker image
-docker build -t cs2-inspect-service-go .
+- Avoid IP-based rate limits from Steam
+- Distribute connections across different regions
+- Improve reliability by having fallback connection methods
 
-# Run the Docker container
-docker run -p 3000:3000 --env-file .env -v $(pwd)/accounts.txt:/app/accounts.txt cs2-inspect-service-go
-```
+Proxies can be configured in two ways:
 
-### Example API calls
+1. **Global proxy configuration** in the `.env` file:
 
-```bash
-# Inspect an item
-curl "http://localhost:3000/inspect?link=steam://rungame/730/76561202255233023/+csgo_econ_action_preview%20S76561198123456789A12345678901D123456789"
+   ```
+   PROXY_ENABLED=true
+   PROXY_URL=socks5://username:password@proxy.example.com:1080
+   ```
 
-# Check service health
-curl "http://localhost:3000/health"
+2. **Per-account proxy configuration** in the `accounts.txt` file:
 
-# Trigger bot reconnection
-curl "http://localhost:3000/reconnect"
+   ```
+   username:password:socks5://proxy.example.com:1080
+   username2:password2:socks5://proxy2.example.com:1080
+   ```
 
-# Get item history
-curl "http://localhost:3000/history?uniqueId=abcd1234"
-```
+When both global and per-account proxies are configured, the per-account proxy takes precedence.
 
-</details>
+> **Note:** The service only supports SOCKS5 proxies. HTTP proxies are not supported.
 
 ## Troubleshooting
 
@@ -584,12 +600,12 @@ curl "http://localhost:3000/history?uniqueId=abcd1234"
 
 ### Bot connection issues
 
-If bots are having trouble connecting to Steam:
+If bots are having trouble connecting to the Game Coordinator:
 
-1. Check that your Steam accounts are valid and have CS2 access
-2. Ensure your IP is not rate-limited by Steam
-3. Try using a VPN or proxy if you're experiencing regional restrictions
-4. Check for Steam maintenance or outages
+1. Check the bot's status using the `/health` endpoint
+2. Try manually reconnecting the bot using the `/reconnect` endpoint with the `force=true` parameter
+3. Verify that your Steam accounts have CS2 access and are not VAC banned
+4. If using proxies, ensure they are working correctly and can connect to Steam servers
 
 ### Database connection issues
 

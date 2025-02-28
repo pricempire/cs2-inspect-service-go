@@ -7,8 +7,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/lib/pq v1.10.9
 	google.golang.org/protobuf v1.30.0
+	golang.org/x/net v0.9.0
 )
-
-require golang.org/x/net v0.9.0 // indirect
 
 replace github.com/Philipp15b/go-steam/v3 => ./go-steam
