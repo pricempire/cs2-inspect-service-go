@@ -2,11 +2,13 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // ANSI color codes
@@ -27,6 +29,10 @@ const (
 	LogDetailEnvVar = "LOG_DETAIL"
 	// Environment variable to enable/disable colored output
 	LogColorEnvVar = "LOG_COLOR"
+	// Environment variable for log directory
+	LogDirEnvVar = "LOG_DIR"
+	// Default log directory
+	DefaultLogDir = "logs"
 )
 
 var (
@@ -34,6 +40,10 @@ var (
 	detailedLoggingEnabled bool
 	// Whether colored logging is enabled
 	coloredLoggingEnabled bool
+	// Log file
+	logFile *os.File
+	// Logger instance
+	logger *log.Logger
 )
 
 // InitLogger initializes the logger with the specified configuration
@@ -44,15 +54,50 @@ func InitLogger() {
 	// Check if colored logging is enabled via environment variable (default to true)
 	coloredLoggingEnabled = os.Getenv(LogColorEnvVar) != "false"
 	
-	// Configure the standard logger to include date and time
-	log.SetFlags(log.LstdFlags)
+	// Get log directory from environment variable or use default
+	logDir := os.Getenv(LogDirEnvVar)
+	if logDir == "" {
+		logDir = DefaultLogDir
+	}
+	
+	// Create logs directory if it doesn't exist
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		log.Printf("Failed to create log directory: %v", err)
+	}
+	
+	// Create log file with current date in the filename
+	currentTime := time.Now().Format("2006-01-02")
+	logFilePath := filepath.Join(logDir, fmt.Sprintf("cs2-inspect-%s.log", currentTime))
+	
+	var err error
+	logFile, err = os.OpenFile(logFilePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("Failed to open log file: %v", err)
+	} else {
+		// Create a multi-writer to write to both console and file
+		multiWriter := io.MultiWriter(os.Stdout, logFile)
+		logger = log.New(multiWriter, "", log.LstdFlags)
+		
+		// Replace the standard logger
+		log.SetOutput(multiWriter)
+		log.SetFlags(log.LstdFlags)
+	}
+	
+	LogInfo("Logging initialized. Logs will be saved to: %s", logFilePath)
 	
 	if detailedLoggingEnabled {
 		LogInfo("Detailed logging enabled - logs will include file and function information")
 	}
 	
 	if coloredLoggingEnabled {
-		LogInfo("Colored logging enabled")
+		LogInfo("Colored logging enabled (console only)")
+	}
+}
+
+// CloseLogger closes the log file
+func CloseLogger() {
+	if logFile != nil {
+		logFile.Close()
 	}
 }
 
@@ -82,8 +127,9 @@ func logWithLevel(level string, color string, format string, args ...interface{}
 	
 	// Prepare the level string with color if enabled
 	levelStr := level
+	coloredLevelStr := level
 	if coloredLoggingEnabled {
-		levelStr = color + level + ColorReset
+		coloredLevelStr = color + level + ColorReset
 	}
 	
 	if detailedLoggingEnabled {
@@ -104,9 +150,23 @@ func logWithLevel(level string, color string, format string, args ...interface{}
 		}
 		
 		// Log with file and function information
-		log.Printf("[%s] %s:%s:%d - %s", levelStr, filename, funcName, line, message)
+		fileInfo := fmt.Sprintf("%s:%s:%d", filename, funcName, line)
+		
+		// For file logging (without colors)
+		if logger != nil {
+			logger.Printf("[%s] %s - %s", levelStr, fileInfo, message)
+		} else {
+			// Fallback to standard log if logger is not initialized
+			// For console (with colors if enabled)
+			log.Printf("[%s] %s - %s", coloredLevelStr, fileInfo, message)
+		}
 	} else {
 		// Log without file and function information
-		log.Printf("[%s] %s", levelStr, message)
+		if logger != nil {
+			logger.Printf("[%s] %s", levelStr, message)
+		} else {
+			// Fallback to standard log if logger is not initialized
+			log.Printf("[%s] %s", coloredLevelStr, message)
+		}
 	}
 } 

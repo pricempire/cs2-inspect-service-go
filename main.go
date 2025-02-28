@@ -24,6 +24,8 @@ func main() {
 	
 	// Initialize the logger
 	InitLogger()
+	// Ensure logger is closed on exit
+	defer CloseLogger()
 	
 	LogInfo("Starting CS:GO Skin Inspect Service")
 	
