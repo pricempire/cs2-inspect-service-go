@@ -2,12 +2,17 @@
 FROM golang:1.23-alpine AS builder
 
 # Install required packages
-RUN apk add --no-cache gcc musl-dev
+RUN apk add --no-cache gcc musl-dev git
 
 WORKDIR /app
 
 # Copy go mod files
 COPY go.mod go.sum ./
+
+# Create go-steam directory and clone the repository
+RUN mkdir -p go-steam && \
+    git submodule init && \
+    git pull --recurse-submodules
 
 # Download dependencies
 RUN go mod download
