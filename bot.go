@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -46,15 +47,26 @@ type BotManager struct {
 	mutex      sync.RWMutex
 	ctx        context.Context
 	cancelFunc context.CancelFunc
+	maxConcurrentInit int // Maximum number of bots to initialize concurrently
 }
 
 // NewBotManager creates a new bot manager
 func NewBotManager() *BotManager {
 	ctx, cancel := context.WithCancel(context.Background())
+	
+	// Get max concurrent initialization from environment or use default
+	maxConcurrentInit := 100
+	if maxEnv := os.Getenv("MAX_CONCURRENT_INIT"); maxEnv != "" {
+		if val, err := strconv.Atoi(maxEnv); err == nil && val > 0 {
+			maxConcurrentInit = val
+		}
+	}
+	
 	return &BotManager{
 		bots:       make([]*Bot, 0),
 		ctx:        ctx,
 		cancelFunc: cancel,
+		maxConcurrentInit: maxConcurrentInit,
 	}
 }
 
@@ -68,19 +80,43 @@ func (bm *BotManager) Initialize() error {
 	
 	LogInfo("Loaded %d accounts", len(accounts))
 	
-	// Initialize bots
+	// Create all bot instances first
 	for _, account := range accounts {
 		bot := NewBot(account, bm.ctx)
 		bm.mutex.Lock()
 		bm.bots = append(bm.bots, bot)
 		bm.mutex.Unlock()
-		
-		// Start the bot
-		go bot.Start()
 	}
 	
-	// Start health monitoring
+	// Use a semaphore to limit concurrent initializations
+	semaphore := make(chan struct{}, bm.maxConcurrentInit)
+	var wg sync.WaitGroup
+	
+	LogInfo("Starting bots with maximum %d concurrent initializations", bm.maxConcurrentInit)
+	
+	// Start bots with limited concurrency
+	for _, bot := range bm.bots {
+		wg.Add(1)
+		go func(b *Bot) {
+			defer wg.Done()
+			
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }() // Release semaphore when done
+			
+			// Start the bot
+			b.Start()
+		}(bot)
+	}
+	
+	// Start health monitoring in a separate goroutine
 	go bm.monitorBotHealth()
+	
+	// Wait for all bots to finish initialization in a separate goroutine
+	go func() {
+		wg.Wait()
+		LogInfo("All bots have completed initialization")
+	}()
 	
 	return nil
 }
