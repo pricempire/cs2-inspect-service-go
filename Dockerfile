@@ -11,7 +11,8 @@ COPY . .
 
 # Initialize and update git submodules
 RUN if [ -d ".git" ]; then \
-        git submodule update --init --recursive; \
+        git submodule update --init --recursive && \
+        git pull --recurse-submodules --jobs=10; \
     else \
         echo "Warning: .git directory not found, cannot update submodules"; \
     fi
