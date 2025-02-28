@@ -6,19 +6,18 @@ RUN apk add --no-cache gcc musl-dev git
 
 WORKDIR /app
 
-# First, copy the entire repository including .git directory
-COPY . .
+# Copy go mod files first
+COPY go.mod go.sum ./
 
-# Initialize and update git submodules
-RUN if [ -d ".git" ]; then \
-        git submodule update --init --recursive && \
-        git pull --recurse-submodules --jobs=10; \
-    else \
-        echo "Warning: .git directory not found, cannot update submodules"; \
-    fi
+# Manually clone the go-steam repository to the expected location
+RUN mkdir -p go-steam && \
+    git clone https://github.com/antal-k/go-steam.git go-steam
 
 # Download dependencies
 RUN go mod download
+
+# Copy the rest of the source code
+COPY . .
 
 # Build the application
 RUN CGO_ENABLED=1 GOOS=linux go build -o cs2-inspect-service -ldflags "-X google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn"
