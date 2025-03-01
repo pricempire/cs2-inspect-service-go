@@ -15,7 +15,11 @@ A Go service for inspecting CS2 items using the Steam Game Coordinator. This ser
 - Float value ranking system
 - Detailed wear information including min/max values
 - Support for special patterns (Case Hardened, Fade, Marble Fade, Doppler phases)
-- SOCKS5 proxy support for bot connections
+- SOCKS5 and HTTP proxy support for bot connections
+- Concurrent bot initialization with queue-based processing
+- Automatic blacklisting of problematic accounts
+- Session management with refresh token support
+- Detailed progress tracking and logging
 - Web interface for testing and API documentation
 
 ## Links
@@ -75,10 +79,19 @@ A Go service for inspecting CS2 items using the Steam Game Coordinator. This ser
    REQUEST_TIMEOUT=30s
    BOT_RECONNECT_INTERVAL=5m
    MAX_CONCURRENT_REQUESTS=10
+   MAX_CONCURRENT_BOTS=10
 
    # Proxy configuration (optional)
    # PROXY_ENABLED=true
    # PROXY_URL=socks5://username:password@proxy.example.com:1080
+   # or for HTTP proxy
+   # PROXY_URL=http://username:password@proxy.example.com:8080
+   # For dynamic session assignment
+   # PROXY_URL=http://username:password@proxy.example.com:8080?session=[session]
+
+   # Session management
+   SESSION_DIR=sessions
+   BLACKLIST_PATH=blacklist.txt
    ```
 
    </details>
@@ -93,11 +106,25 @@ A Go service for inspecting CS2 items using the Steam Game Coordinator. This ser
    username2:password2
    ```
 
+   For accounts with additional authentication information:
+
+   ```
+   username:password:sentry_hash:shared_secret
+   ```
+
+   The `sentry_hash` and `shared_secret` are used for Steam Guard authentication.
+
    For accounts with proxies, you can specify them per account:
 
    ```
    username:password:socks5://proxy.example.com:1080
-   username2:password2:socks5://proxy2.example.com:1080
+   username2:password2:http://proxy2.example.com:8080
+   ```
+
+   Full format with all options:
+
+   ```
+   username:password:sentry_hash:shared_secret:proxy_url
    ```
 
    </details>
@@ -239,13 +266,26 @@ GET /health
 ```json
 {
 	"status": "healthy",
-	"bots": [
+	"bots": {
+		"ready": 10,
+		"busy": 0,
+		"cooldown": 0,
+		"disconnected": 0,
+		"error": 0,
+		"initializing": 0,
+		"total": 10,
+		"utilization": "0.00%"
+	},
+	"details": [
 		{
 			"username": "bot1",
 			"connected": true,
 			"loggedOn": true,
 			"ready": true,
-			"busy": false
+			"busy": false,
+			"state": "ready",
+			"lastUsed": "2023-06-01T12:34:56Z",
+			"reconnectAttempts": 0
 		},
 		{
 			"username": "bot2",
@@ -463,38 +503,103 @@ For Marble Fade knives, the service identifies special patterns based on the pai
 - And more
 </details>
 
-## Bot Management
+## Proxy Support
 
-The service manages multiple Steam bots to handle concurrent inspect requests.
+The service supports using SOCKS5 and HTTP proxies for bot connections to Steam. This can be useful to:
 
-<details>
-<summary>Bot management details</summary>
+- Avoid IP-based rate limits from Steam
+- Distribute connections across different regions
+- Improve reliability by having fallback connection methods
 
-### Bot States
+Proxies can be configured in two ways:
 
-Bots can be in one of the following states:
+1. **Global proxy configuration** in the `.env` file:
 
-- `DISCONNECTED`: Bot is not connected to Steam
-- `CONNECTING`: Bot is connecting to Steam
-- `CONNECTED`: Bot is connected to Steam but not logged in
-- `LOGGING_IN`: Bot is logging in to Steam
-- `LOGGED_IN`: Bot is logged in to Steam but not ready for Game Coordinator requests
-- `READY`: Bot is ready to handle Game Coordinator requests
-- `BUSY`: Bot is currently handling a Game Coordinator request
+   ```
+   PROXY_ENABLED=true
+   PROXY_URL=socks5://username:password@proxy.example.com:1080
+   # or for HTTP proxy
+   PROXY_URL=http://username:password@proxy.example.com:8080
+   ```
 
-### Bot Selection
+2. **Per-account proxy configuration** in the `accounts.txt` file:
 
-When a request is received, the service selects an available bot (in the `READY` state) to handle the request. If no bots are available, the request fails with an error.
+   ```
+   username:password:socks5://proxy.example.com:1080
+   username2:password2:http://proxy2.example.com:8080
+   ```
 
-### Automatic Reconnection
+When both global and per-account proxies are configured, the per-account proxy takes precedence.
 
-The service automatically reconnects bots that go down or become unresponsive. It also periodically checks the Game Coordinator connection and reconnects if necessary.
+The service now supports both SOCKS5 and HTTP proxies:
 
-### Manual Reconnection
+- **SOCKS5 proxies**: Full support for TCP connections
+- **HTTP proxies**: Support for CONNECT method to establish TCP tunnels
 
-The service provides an endpoint to manually trigger a reconnection for all bots, which can be useful if the bots are stuck in an invalid state.
+You can also use the `PROXY_URL` environment variable with a template format to automatically assign different proxies to bots:
 
-</details>
+```
+PROXY_URL=http://username:password@proxy.example.com:8080?session=[session]
+```
+
+The `[session]` placeholder will be replaced with the bot's username and an index, allowing for unique session identifiers per bot.
+
+## Enhanced Bot Management
+
+The service includes several improvements to bot management:
+
+### Concurrent Bot Initialization
+
+The bot initialization process has been enhanced to support efficient concurrent initialization:
+
+- A configurable maximum number of concurrent initializations (default: 10)
+- Queue-based processing to ensure all bots are initialized without overwhelming the system
+- Progress tracking and detailed logging of initialization status
+- Automatic timeout handling for bots that fail to initialize within a reasonable time
+
+You can configure the maximum concurrent initializations using the environment variable:
+
+```
+MAX_CONCURRENT_BOTS=10
+```
+
+### Improved Health Monitoring
+
+The bot health monitoring system has been enhanced with:
+
+- Periodic Game Coordinator connection checks
+- Automatic detection and recovery of disconnected bots
+- Proactive reconnection of bots with GC connection issues
+- Detailed health status reporting via the `/health` endpoint
+- Reconnection queue to manage bot reconnections in a controlled manner
+
+### Session Management
+
+The service now includes improved session management:
+
+- Persistent storage of refresh tokens for faster reconnection
+- Automatic session recovery after service restart
+- Session file rotation to prevent token expiration
+- Blacklisting of problematic accounts with reason tracking
+
+## Blacklist System
+
+The service now includes a blacklist system to automatically exclude problematic accounts:
+
+- Accounts with invalid credentials
+- Accounts requiring Steam Guard authentication
+- Banned or disabled accounts
+- Accounts with other persistent connection issues
+
+The blacklist is stored in a `blacklist.txt` file and includes the reason for blacklisting:
+
+```
+username:credentials
+username2:steamguard
+username3:banned
+```
+
+Blacklisted accounts are automatically skipped during initialization, preventing them from causing repeated connection failures.
 
 ## Logging
 
@@ -543,34 +648,6 @@ The service includes a web interface for testing the API and viewing documentati
 
 The web interface is accessible at the root URL of the service (e.g., `http://localhost:3000/`).
 
-## Proxy Support
-
-The service supports using SOCKS5 proxies for bot connections to Steam. This can be useful to:
-
-- Avoid IP-based rate limits from Steam
-- Distribute connections across different regions
-- Improve reliability by having fallback connection methods
-
-Proxies can be configured in two ways:
-
-1. **Global proxy configuration** in the `.env` file:
-
-   ```
-   PROXY_ENABLED=true
-   PROXY_URL=socks5://username:password@proxy.example.com:1080
-   ```
-
-2. **Per-account proxy configuration** in the `accounts.txt` file:
-
-   ```
-   username:password:socks5://proxy.example.com:1080
-   username2:password2:socks5://proxy2.example.com:1080
-   ```
-
-When both global and per-account proxies are configured, the per-account proxy takes precedence.
-
-> **Note:** The service only supports SOCKS5 proxies. HTTP proxies are not supported.
-
 ## Troubleshooting
 
 <details>
@@ -584,6 +661,19 @@ If bots are having trouble connecting to the Game Coordinator:
 2. Try manually reconnecting the bot using the `/reconnect` endpoint with the `force=true` parameter
 3. Verify that your Steam accounts have CS2 access and are not VAC banned
 4. If using proxies, ensure they are working correctly and can connect to Steam servers
+5. Check the blacklist.txt file to see if accounts have been automatically blacklisted
+6. Verify that your HTTP proxies support the CONNECT method if you're using HTTP proxies
+7. Check the session files in the sessions directory for any issues with refresh tokens
+
+### Bot initialization issues
+
+If bots are not initializing properly:
+
+1. Check the logs for any errors during the initialization process
+2. Verify that the MAX_CONCURRENT_BOTS setting is appropriate for your system
+3. Ensure that your proxies can handle the concurrent connection load
+4. Check if Steam is experiencing login issues or maintenance
+5. Try increasing the initialization timeout if bots are timing out during initialization
 
 ### Database connection issues
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"net/http"
 	"os"
 	"time"
@@ -85,8 +84,7 @@ func main() {
 	http.HandleFunc("/float", handleInspect)
 	http.HandleFunc("/", handleInspect)
 	
-	http.HandleFunc("/health", handleHealth)
-	http.HandleFunc("/reconnect", handleReconnect)
+	http.HandleFunc("/health", handleHealth) 
 	http.HandleFunc("/history", handleHistory)
 	
 	// Start HTTP server
@@ -126,135 +124,5 @@ func collectMetrics() {
 				requestHistory = requestHistory[len(requestHistory)-60:]
 			}
 		}
-	}
-}
-
-// handleReconnect handles requests to manually reconnect bots
-func handleReconnect(w http.ResponseWriter, r *http.Request) {
-	// Set CORS headers
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-	
-	// Handle OPTIONS request
-	if r.Method == "OPTIONS" {
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-	
-	// Only allow GET and POST requests
-	if r.Method != "GET" && r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Get the username from the query string (optional)
-	username := r.URL.Query().Get("username")
-	
-	// Check for force parameter
-	forceRestart := r.URL.Query().Get("force") == "true"
-	
-	// If botManager is nil, return an error
-	if botManager == nil {
-		sendJSONResponse(w, ReconnectResponse{
-			Success: false,
-			Message: "Bot manager not initialized",
-		})
-		return
-	}
-	
-	reconnectedCount := 0
-	
-	// If a username is provided, only reconnect that bot
-	if username != "" {
-		// Check if the account is blacklisted
-		if isBlacklisted(username) {
-			LogWarning("Manual reconnect requested for blacklisted bot: %s", username)
-			sendJSONResponse(w, ReconnectResponse{
-				Success: false,
-				Message: fmt.Sprintf("Bot %s is blacklisted", username),
-			})
-			return
-		}
-		
-		LogInfo("Manual reconnect triggered for bot: %s (force: %v)", username, forceRestart)
-		
-		// Send reconnect command to bot manager thread
-		resultChan := make(chan botResponse, 1)
-		botManager.commandChan <- botCommand{
-			action:      "reconnectBot",
-			botUsername: username,
-			resultChan:  resultChan,
-		}
-		
-		// Wait for response with timeout
-		select {
-		case resp := <-resultChan:
-			if resp.success {
-				reconnectedCount++
-				sendJSONResponse(w, ReconnectResponse{
-					Success: true,
-					Message: resp.message,
-				})
-			} else {
-				sendJSONResponse(w, ReconnectResponse{
-					Success: false,
-					Message: resp.message,
-				})
-			}
-		case <-time.After(5 * time.Second):
-			// Timeout, but reconnect is likely still in progress
-			sendJSONResponse(w, ReconnectResponse{
-				Success: true,
-				Message: fmt.Sprintf("Reconnect for bot %s is in progress", username),
-			})
-		}
-		
-		return
-	} else {
-		// For reconnecting all bots, we'll use a different approach
-		// since we don't want to block the HTTP response
-		
-		// Get a list of all bot usernames
-		var botUsernames []string
-		botManager.mutex.RLock()
-		for _, bot := range botManager.bots {
-			bot.mutex.Lock()
-			botUsernames = append(botUsernames, bot.account.Username)
-			bot.mutex.Unlock()
-		}
-		botManager.mutex.RUnlock()
-		
-		// Start a goroutine to reconnect all bots
-		go func(usernames []string) {
-			for _, username := range usernames {
-				// Skip blacklisted accounts
-				if isBlacklisted(username) {
-					LogWarning("Skipping reconnect for blacklisted bot: %s", username)
-					continue
-				}
-				
-				// Send reconnect command
-				resultChan := make(chan botResponse, 1)
-				botManager.commandChan <- botCommand{
-					action:      "reconnectBot",
-					botUsername: username,
-					resultChan:  resultChan,
-				}
-				
-				// Don't wait for response, just fire and forget
-				// The bot manager thread will handle it
-				
-				// Add a small delay between reconnects to avoid overwhelming the system
-				time.Sleep(500 * time.Millisecond)
-			}
-		}(botUsernames)
-		
-		// Return success immediately
-		sendJSONResponse(w, ReconnectResponse{
-			Success: true,
-			Message: fmt.Sprintf("Reconnect initiated for all bots (%d total)", len(botUsernames)),
-		})
-		return
 	}
 } 

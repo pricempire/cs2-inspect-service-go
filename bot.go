@@ -8,6 +8,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,12 @@ type BotManager struct {
 	// Status tracking
 	isInitialized  bool
 	initError      error
+	initComplete   bool // Flag to track when initialization is complete
+	
+	// Reconnection queue
+	reconnectQueue     chan *Bot
+	reconnectQueueSize int
+	reconnectMutex     sync.Mutex
 }
 
 // botCommand represents a command sent to the bot manager thread
@@ -80,9 +87,19 @@ func NewBotManager() *BotManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	
 	// Determine max concurrent bot operations from env or use default
-	maxConcurrent := 10
+	maxConcurrent := 5000
 	
-	return &BotManager{
+	// Try to get the max concurrent value from environment variable
+	if maxConcurrentStr := os.Getenv("MAX_CONCURRENT_BOTS"); maxConcurrentStr != "" {
+		if value, err := strconv.Atoi(maxConcurrentStr); err == nil && value > 0 {
+			maxConcurrent = value
+			LogInfo("Using MAX_CONCURRENT_BOTS=%d from environment", maxConcurrent)
+		} else {
+			LogWarning("Invalid MAX_CONCURRENT_BOTS value: %s, using default: %d", maxConcurrentStr, maxConcurrent)
+		}
+	}
+	
+	bm := &BotManager{
 		bots:          make([]*Bot, 0),
 		ctx:           ctx,
 		cancelFunc:    cancel,
@@ -91,7 +108,13 @@ func NewBotManager() *BotManager {
 		commandChan:   make(chan botCommand, 100),
 		responseChan:  make(chan botResponse, 100),
 		isInitialized: false,
+		reconnectQueue: make(chan *Bot, 100),
 	}
+	
+	// Start the reconnection queue processor
+	go bm.processReconnectQueue()
+	
+	return bm
 }
 
 // Initialize loads accounts and starts bots in a completely separate goroutine
@@ -117,33 +140,163 @@ func (bm *BotManager) botManagerThread() {
 	
 	LogInfo("Loaded %d accounts", len(accounts))
 	
-	// Initialize all bots
-	for _, account := range accounts {
+	// Create all bot instances first
+	for i, account := range accounts {
+		// Create the bot instance
 		bot := NewBot(account, bm.ctx)
+		
+		// Add the bot to the manager's list
 		bm.mutex.Lock()
 		bm.bots = append(bm.bots, bot)
 		bm.mutex.Unlock()
 		
-		// Start the bot using the worker pool
-		go func(b *Bot) {
-			// Acquire a worker slot
-			bm.workerPool <- struct{}{}
-			defer func() {
-				// Release the worker slot when done
-				<-bm.workerPool
-			}()
-			
-			// Start the bot
-			b.Start()
-		}(bot)
+		LogInfo("Created bot %d/%d: %s", i+1, len(accounts), account.Username)
 	}
 	
-	LogInfo("All bots have been queued for initialization")
+	// Initialize bots with a non-blocking approach
+	totalBots := len(bm.bots)
+	LogInfo("Starting initialization of %d bots with max concurrency of %d", totalBots, bm.maxConcurrent)
 	
-	// Start health monitoring
-	go bm.monitorBotHealth()
+	// Create a channel to queue all bots for initialization
+	botQueue := make(chan *Bot, totalBots)
 	
-	// Mark as initialized
+	// Queue all bots for initialization
+	go func() {
+		for _, bot := range bm.bots {
+			botQueue <- bot
+		}
+		close(botQueue)
+		LogInfo("All %d bots have been queued for initialization", totalBots)
+	}()
+	
+	// Create a wait group to track completion
+	var wg sync.WaitGroup
+	wg.Add(totalBots)
+	
+	// Create counters for tracking initialization progress
+	var (
+		initCounter     int32
+		initMutex       sync.Mutex
+		lastProgressLog time.Time = time.Now()
+	)
+	
+	// Function to update and log progress
+	updateProgress := func() {
+		initMutex.Lock()
+		defer initMutex.Unlock()
+		
+		initCounter++
+		current := initCounter
+		total := int32(totalBots)
+		
+		// Log progress every 10 bots or every 30 seconds, whichever comes first
+		if current%10 == 0 || time.Since(lastProgressLog) > 30*time.Second {
+			percentage := float64(current) / float64(total) * 100
+			LogInfo("Bot initialization progress: %d/%d (%.1f%%)", current, total, percentage)
+			lastProgressLog = time.Now()
+		}
+	}
+	
+	// Start worker goroutines to initialize bots
+	for i := 0; i < bm.maxConcurrent; i++ {
+		workerID := i + 1
+		go func(id int) {
+			LogInfo("Starting worker %d for bot initialization", id)
+			for bot := range botQueue {
+				// Initialize this bot
+				LogInfo("Worker %d: Starting initialization of bot %s", id, bot.account.Username)
+				
+				// Create a timeout channel for this bot's initialization
+				initTimeout := time.After(3 * time.Minute)
+				
+				// Create a channel to signal completion
+				done := make(chan bool, 1)
+				
+				// Start the bot in a separate goroutine
+				go func() {
+					// Start the bot
+					bot.Start()
+					
+					// Signal completion
+					done <- true
+				}()
+				
+				// Wait for either completion or timeout
+				select {
+				case <-done:
+					// Bot initialization completed successfully
+					LogInfo("Worker %d: Bot %s initialization complete", id, bot.account.Username)
+				case <-initTimeout:
+					// Bot initialization timed out
+					LogWarning("Worker %d: Bot %s initialization timed out after 3 minutes", id, bot.account.Username)
+					
+					// Force disconnect the bot to clean up resources
+					bot.mutex.Lock()
+					if bot.client != nil {
+						bot.client.Disconnect()
+						bot.client = nil
+					}
+					if bot.cs2Handler != nil {
+						bot.cs2Handler.Shutdown()
+						bot.cs2Handler = nil
+					}
+					bot.state = BotStateDisconnected
+					bot.mutex.Unlock()
+				}
+				
+				// Update progress counter regardless of success or timeout
+				updateProgress()
+				
+				// Mark this bot as done
+				wg.Done()
+			}
+			LogInfo("Worker %d: Finished processing bot queue", id)
+		}(workerID)
+	}
+	
+	// Wait for all initializations to complete in a separate goroutine
+	go func() {
+		// Wait for all bots to initialize
+		wg.Wait()
+		LogInfo("All %d bots have been fully initialized", totalBots)
+		
+		// Count how many bots are in each state
+		bm.mutex.RLock()
+		readyCount := 0
+		loggedInCount := 0
+		disconnectedCount := 0
+		otherCount := 0
+		
+		for _, bot := range bm.bots {
+			bot.mutex.Lock()
+			switch bot.state {
+			case BotStateReady:
+				readyCount++
+			case BotStateLoggedIn:
+				loggedInCount++
+			case BotStateDisconnected:
+				disconnectedCount++
+			default:
+				otherCount++
+			}
+			bot.mutex.Unlock()
+		}
+		bm.mutex.RUnlock()
+		
+		LogInfo("Bot initialization summary: Ready=%d, LoggedIn=%d, Disconnected=%d, Other=%d",
+			readyCount, loggedInCount, disconnectedCount, otherCount)
+		
+		// Mark initialization as complete
+		bm.mutex.Lock()
+		bm.initComplete = true
+		bm.mutex.Unlock()
+		
+		// Now that initialization is complete, start health monitoring
+		go bm.monitorBotHealth()
+		LogInfo("Bot health monitoring started after initialization completed")
+	}()
+	
+	// Mark as initialized - the bots will continue to initialize in the background
 	bm.isInitialized = true
 	
 	// Process commands
@@ -411,9 +564,21 @@ func (bm *BotManager) monitorBotHealth() {
 	// Map to track last reconnect time for each bot
 	lastReconnectTime := make(map[string]time.Time)
 	
+	LogInfo("Bot health monitoring started")
+	
 	for {
 		select {
 		case <-ticker.C:
+			// Skip health checks if initialization is not complete
+			bm.mutex.RLock()
+			initComplete := bm.initComplete
+			bm.mutex.RUnlock()
+			
+			if !initComplete {
+				LogDebug("Health monitor: Skipping health check as initialization is not complete")
+				continue
+			}
+			
 			bm.mutex.RLock()
 			for _, bot := range bm.bots {
 				// Skip nil bots
@@ -471,18 +636,15 @@ func (bm *BotManager) monitorBotHealth() {
 				shouldTriggerReconnect := !exists || now.Sub(lastReconnect) > 2*time.Minute
 				
 				if needsReconnect && shouldTriggerReconnect {
-					LogWarning("Health monitor: Bot %s is disconnected (attempt %d), triggering reconnect", 
+					LogWarning("Health monitor: Bot %s is disconnected (attempt %d), adding to reconnect queue", 
 						username, reconnectAttempts)
 					
 					// Record this reconnect attempt
 					lastReconnectTime[username] = now
 					
-					// Force a complete reconnect with new client
-					go func(b *Bot) {
-						// Add a small random delay to avoid all bots reconnecting simultaneously
-						time.Sleep(time.Duration(rand.Intn(5)) * time.Second)
-						b.Reconnect()
-					}(bot)
+					// Add to reconnection queue instead of directly reconnecting
+					bm.QueueBotForReconnect(bot)
+					
 				} else if needsGCReconnect && shouldTriggerReconnect {
 					LogWarning("Health monitor: Bot %s is logged in but GC not ready, sending hello", username)
 					
@@ -499,6 +661,77 @@ func (bm *BotManager) monitorBotHealth() {
 			return
 		}
 	}
+}
+
+// processReconnectQueue handles the reconnection of bots in a controlled manner
+func (bm *BotManager) processReconnectQueue() {
+	LogInfo("Bot reconnection queue processor started")
+	
+	for {
+		select {
+		case bot := <-bm.reconnectQueue:
+			// Process bot reconnection
+			if bot == nil {
+				continue
+			}
+			
+			// Decrement the queue size
+			bm.reconnectMutex.Lock()
+			bm.reconnectQueueSize--
+			queueSize := bm.reconnectQueueSize
+			bm.reconnectMutex.Unlock()
+			
+			LogInfo("Processing reconnection for bot %s (queue size: %d)", bot.account.Username, queueSize)
+			
+			// Acquire a worker slot
+			bm.workerPool <- struct{}{}
+			
+			// Reconnect the bot
+			success := bot.Reconnect()
+			
+			// Release the worker slot
+			<-bm.workerPool
+			
+			if success {
+				LogInfo("Bot %s reconnected successfully", bot.account.Username)
+			} else {
+				LogWarning("Bot %s reconnection failed", bot.account.Username)
+			}
+			
+		case <-bm.ctx.Done():
+			LogInfo("Bot reconnection queue processor shutting down")
+			return
+		}
+	}
+}
+
+// QueueBotForReconnect adds a bot to the reconnection queue
+func (bm *BotManager) QueueBotForReconnect(bot *Bot) {
+	if bot == nil {
+		return
+	}
+	
+	// Check if the bot is already in the queue
+	bm.reconnectMutex.Lock()
+	defer bm.reconnectMutex.Unlock()
+	
+	// Add to queue size counter
+	bm.reconnectQueueSize++
+	queueSize := bm.reconnectQueueSize
+	
+	// Add to the queue
+	go func() {
+		LogInfo("Queuing bot %s for reconnection (queue size: %d)", bot.account.Username, queueSize)
+		select {
+		case bm.reconnectQueue <- bot:
+			// Successfully added to queue
+		case <-bm.ctx.Done():
+			// Bot manager is shutting down
+			bm.reconnectMutex.Lock()
+			bm.reconnectQueueSize--
+			bm.reconnectMutex.Unlock()
+		}
+	}()
 }
 
 // Bot represents a Steam bot with improved state management
@@ -655,173 +888,244 @@ func (b *Bot) connect() bool {
 			eventTimeoutTimer := time.NewTimer(60 * time.Second)
 			timeoutActive := true
 			
-			for {
-				// Check if client is still valid before proceeding
-				b.mutex.Lock()
-				if b.client == nil {
-					LogWarning("Bot %s: Client is nil, breaking event loop", b.account.Username)
-					b.state = BotStateDisconnected
+			// Create a channel to signal when we should exit the event loop
+			exitEventLoop := make(chan bool, 1)
+			
+			// Start a goroutine to process events
+			go func() {
+				for {
+					// Check if client is still valid before proceeding
+					b.mutex.Lock()
+					if b.client == nil {
+						LogWarning("Bot %s: Client is nil, breaking event loop", b.account.Username)
+						b.state = BotStateDisconnected
+						b.mutex.Unlock()
+						exitEventLoop <- true
+						return
+					}
+					clientCopy := b.client // Make a copy of the client pointer while under mutex lock
 					b.mutex.Unlock()
-					break
-				}
-				clientCopy := b.client // Make a copy of the client pointer while under mutex lock
-				b.mutex.Unlock()
-				
-				// If timeout is not active, drain the channel if needed and stop the timer
-				if !timeoutActive && !eventTimeoutTimer.Stop() {
-					select {
-					case <-eventTimeoutTimer.C:
-					default:
-					}
-				}
-				
-				select {
-				case event, ok := <-clientCopy.Events():
-					// Check if channel is closed
-					if !ok {
-						LogWarning("Bot %s: Events channel closed", b.account.Username)
-						b.mutex.Lock()
-						b.state = BotStateDisconnected
-						if b.client != nil {
-							b.client.Disconnect()
-							b.client = nil
-						}
-						if b.cs2Handler != nil {
-							b.cs2Handler.Shutdown()
-							b.cs2Handler = nil
-						}
-						b.mutex.Unlock()
-						return false
-					}
 					
-					switch event.(type) {
-					case *goSteam.ConnectedEvent:
-						LogInfo("Bot %s: Connected to Steam", b.account.Username)
-						b.mutex.Lock()
-						b.state = BotStateConnected
-						connected = true
-						b.reconnectAttempts = 0
-						b.reconnectDelay = InitialReconnectDelay
-						b.mutex.Unlock()
-						
-						// Log on
-						b.mutex.Lock()
-						b.state = BotStateLoggingIn
-						b.mutex.Unlock()
-						
-						loginDetails := &goSteam.LogOnDetails{
-							Username: b.account.Username,
-							Password: b.account.Password,
-						}
-						
-						// Use refresh token if available
-						if b.refreshToken != "" {
-							LogInfo("Bot %s: Attempting login with refresh token", b.account.Username)
-							loginDetails.RefreshToken = b.refreshToken
-							loginDetails.Password = "" // Clear password when using refresh token
-						} else {
-							LogInfo("Bot %s: Attempting login with password", b.account.Username)
-						}
-						
-						b.client.Auth.LogOn(loginDetails)
-						
-						// Reset the event timeout after connecting
-						eventTimeoutTimer.Reset(60 * time.Second)
-						
-					case *goSteam.LoggedOnEvent:
-						LogInfo("Bot %s: Logged on to Steam", b.account.Username)
-						b.mutex.Lock()
-						b.state = BotStateLoggedIn
-						loggedOn = true
-						b.mutex.Unlock()
-						
-						// Set game played
-						b.client.GC.SetGamesPlayed(CS2AppID)
-						
-						// Send hello to GC
-						b.SendHello()
-						
-					case *goSteam.LogOnFailedEvent:
-						logonFailed := event.(*goSteam.LogOnFailedEvent)
-						LogError("Bot %s: Login failed with result: %v", b.account.Username, logonFailed.Result)
-						
-						// Handle specific login failure cases
-						switch logonFailed.Result {
-						case steamlang.EResult_InvalidPassword, steamlang.EResult_AccountLogonDenied, steamlang.EResult_IllegalPassword:
-							// Invalid credentials - blacklist the account
-							LogError("Bot %s: Invalid credentials. Blacklisting account.", b.account.Username)
-							if err := blacklistAccount(b.account.Username, BlacklistReasonCredentials); err != nil {
-								LogError("Bot %s: Failed to blacklist account: %v", b.account.Username, err)
-							}
-							
-						case steamlang.EResult_AccountLogonDeniedNoMail, steamlang.EResult_AccountLogonDeniedVerifiedEmailRequired,
-							steamlang.EResult_AccountLoginDeniedNeedTwoFactor, steamlang.EResult_TwoFactorCodeMismatch,
-							steamlang.EResult_TwoFactorActivationCodeMismatch:
-							// Steam Guard issues - blacklist the account
-							LogError("Bot %s: Steam Guard required or misconfigured. Blacklisting account.", b.account.Username)
-							if err := blacklistAccount(b.account.Username, BlacklistReasonSteamGuard); err != nil {
-								LogError("Bot %s: Failed to blacklist account: %v", b.account.Username, err)
-							}
-							
-						case steamlang.EResult_Banned, steamlang.EResult_AccountDisabled, steamlang.EResult_AccountLockedDown,
-							steamlang.EResult_Suspended, steamlang.EResult_AccountLimitExceeded:
-							// Account banned or disabled - blacklist the account
-							LogError("Bot %s: Account banned or disabled. Blacklisting account.", b.account.Username)
-							if err := blacklistAccount(b.account.Username, BlacklistReasonBanned); err != nil {
-								LogError("Bot %s: Failed to blacklist account: %v", b.account.Username, err)
-							}
-							
-						case steamlang.EResult_AccountLoginDeniedThrottle, steamlang.EResult_RateLimitExceeded:
-							// Rate limited - don't blacklist, just retry with different proxy
-							LogWarning("Bot %s: Login throttled. Will retry with different proxy.", b.account.Username)
-							
+					// If timeout is not active, drain the channel if needed and stop the timer
+					if !timeoutActive && !eventTimeoutTimer.Stop() {
+						select {
+						case <-eventTimeoutTimer.C:
 						default:
-							// Other errors - log but don't blacklist
-							LogError("Bot %s: Login failed with unhandled result: %v", b.account.Username, logonFailed.Result)
 						}
-						
-						b.mutex.Lock()
-						b.state = BotStateDisconnected
-						b.mutex.Unlock()
-						
-						// Signal disconnection
-						return false
-						
-					case *goSteam.MachineAuthUpdateEvent:
-						// Handle Steam Guard
-						LogInfo("Bot %s: Received machine auth update", b.account.Username)
-						
-					case *goSteam.LoginKeyEvent:
-						// Handle login key
-						LogInfo("Bot %s: Received login key", b.account.Username)
-						
-					case *goSteam.DisconnectedEvent:
-						LogInfo("Bot %s: Disconnected from Steam", b.account.Username)
-						b.mutex.Lock()
-						b.state = BotStateDisconnected
-						b.mutex.Unlock()
-						
-						// Signal disconnection
-						close(readySignal)
-						return false
 					}
 					
-					// If we're fully connected and logged in, check if GC is ready
-					if connected && loggedOn {
-						b.mutex.Lock()
-						isReady := b.cs2Handler.IsReady()
-						currentState := b.state
-						b.mutex.Unlock()
+					select {
+					case event, ok := <-clientCopy.Events():
+						// Check if channel is closed
+						if !ok {
+							LogWarning("Bot %s: Events channel closed", b.account.Username)
+							b.mutex.Lock()
+							b.state = BotStateDisconnected
+							if b.client != nil {
+								b.client.Disconnect()
+								b.client = nil
+							}
+							if b.cs2Handler != nil {
+								b.cs2Handler.Shutdown()
+								b.cs2Handler = nil
+							}
+							b.mutex.Unlock()
+							exitEventLoop <- true
+							return
+						}
 						
-						if isReady && currentState != BotStateReady {
-							LogInfo("Bot %s: GC ready check after hello - isReady: %v",
-								b.account.Username, isReady)
+						switch event.(type) {
+						case *goSteam.ConnectedEvent:
+							LogInfo("Bot %s: Connected to Steam", b.account.Username)
+							b.mutex.Lock()
+							b.state = BotStateConnected
+							connected = true
+							b.reconnectAttempts = 0
+							b.reconnectDelay = InitialReconnectDelay
+							b.mutex.Unlock()
+							
+							// Log on
+							b.mutex.Lock()
+							b.state = BotStateLoggingIn
+							b.mutex.Unlock()
+							
+							loginDetails := &goSteam.LogOnDetails{
+								Username: b.account.Username,
+								Password: b.account.Password,
+							}
+							
+							// Use refresh token if available
+							if b.refreshToken != "" {
+								LogInfo("Bot %s: Attempting login with refresh token", b.account.Username)
+								loginDetails.RefreshToken = b.refreshToken
+								loginDetails.Password = "" // Clear password when using refresh token
+							} else {
+								LogInfo("Bot %s: Attempting login with password", b.account.Username)
+							}
+							
+							b.client.Auth.LogOn(loginDetails)
+							
+							// Reset the event timeout after connecting
+							eventTimeoutTimer.Reset(60 * time.Second)
+							
+						case *goSteam.LoggedOnEvent:
+							LogInfo("Bot %s: Logged on to Steam", b.account.Username)
+							b.mutex.Lock()
+							b.state = BotStateLoggedIn
+							loggedOn = true
+							b.mutex.Unlock()
+							
+							// Set game played
+							b.client.GC.SetGamesPlayed(CS2AppID)
+							
+							// Send hello to GC
+							b.SendHello()
+							
+						case *goSteam.LogOnFailedEvent:
+							logonFailed := event.(*goSteam.LogOnFailedEvent)
+							LogError("Bot %s: Login failed with result: %v", b.account.Username, logonFailed.Result)
+							
+							// Handle specific login failure cases
+							switch logonFailed.Result {
+							case steamlang.EResult_InvalidPassword, steamlang.EResult_AccountLogonDenied, steamlang.EResult_IllegalPassword:
+								// Invalid credentials - blacklist the account
+								LogError("Bot %s: Invalid credentials. Blacklisting account.", b.account.Username)
+								if err := blacklistAccount(b.account.Username, BlacklistReasonCredentials); err != nil {
+									LogError("Bot %s: Failed to blacklist account: %v", b.account.Username, err)
+								}
+								
+							case steamlang.EResult_AccountLogonDeniedNoMail, steamlang.EResult_AccountLogonDeniedVerifiedEmailRequired,
+								steamlang.EResult_AccountLoginDeniedNeedTwoFactor, steamlang.EResult_TwoFactorCodeMismatch,
+								steamlang.EResult_TwoFactorActivationCodeMismatch:
+								// Steam Guard issues - blacklist the account
+								LogError("Bot %s: Steam Guard required or misconfigured. Blacklisting account.", b.account.Username)
+								if err := blacklistAccount(b.account.Username, BlacklistReasonSteamGuard); err != nil {
+									LogError("Bot %s: Failed to blacklist account: %v", b.account.Username, err)
+								}
+								
+							case steamlang.EResult_Banned, steamlang.EResult_AccountDisabled, steamlang.EResult_AccountLockedDown,
+								steamlang.EResult_Suspended, steamlang.EResult_AccountLimitExceeded:
+								// Account banned or disabled - blacklist the account
+								LogError("Bot %s: Account banned or disabled. Blacklisting account.", b.account.Username)
+								if err := blacklistAccount(b.account.Username, BlacklistReasonBanned); err != nil {
+									LogError("Bot %s: Failed to blacklist account: %v", b.account.Username, err)
+								}
+								
+							case steamlang.EResult_AccountLoginDeniedThrottle, steamlang.EResult_RateLimitExceeded:
+								// Rate limited - don't blacklist, just retry with different proxy
+								LogWarning("Bot %s: Login throttled. Will retry with different proxy.", b.account.Username)
+								
+							default:
+								// Other errors - log but don't blacklist
+								LogError("Bot %s: Login failed with unhandled result: %v", b.account.Username, logonFailed.Result)
+							}
 							
 							b.mutex.Lock()
+							b.state = BotStateDisconnected
+							b.mutex.Unlock()
+							
+							// Signal disconnection
+							exitEventLoop <- true
+							return
+							
+						case *goSteam.MachineAuthUpdateEvent:
+							// Handle Steam Guard
+							LogInfo("Bot %s: Received machine auth update", b.account.Username)
+							
+						case *goSteam.LoginKeyEvent:
+							// Handle login key
+							LogInfo("Bot %s: Received login key", b.account.Username)
+							
+						case *goSteam.DisconnectedEvent:
+							LogInfo("Bot %s: Disconnected from Steam", b.account.Username)
+							b.mutex.Lock()
+							b.state = BotStateDisconnected
+							b.mutex.Unlock()
+							
+							// Signal disconnection
+							close(readySignal)
+							exitEventLoop <- true
+							return
+						}
+						
+						// If we're fully connected and logged in, check if GC is ready
+						if connected && loggedOn {
+							b.mutex.Lock()
+							isReady := b.cs2Handler != nil && b.cs2Handler.IsReady()
+							currentState := b.state
+							b.mutex.Unlock()
+							
+							if isReady && currentState != BotStateReady {
+								LogInfo("Bot %s: GC ready check after hello - isReady: %v",
+									b.account.Username, isReady)
+								
+								b.mutex.Lock()
+								b.state = BotStateReady
+								b.mutex.Unlock()
+								
+								LogInfo("Bot %s: Ready to handle requests (after hello)", b.account.Username)
+								
+								// Signal that the bot is ready
+								select {
+								case readySignal <- true:
+									LogInfo("Bot %s: Sent ready signal to main event loop", b.account.Username)
+								default:
+									// Channel already has a value or is closed
+								}
+								
+								// Disable the event timeout
+								timeoutActive = false
+							}
+						}
+						
+					case <-eventTimeoutTimer.C:
+						// Event timeout occurred
+						b.mutex.Lock()
+						currentState := b.state
+						
+						// Check if client is nil before proceeding
+						if b.client == nil {
+							LogWarning("Bot %s: Client is nil during event timeout", b.account.Username)
+							b.state = BotStateDisconnected
+							b.mutex.Unlock()
+							exitEventLoop <- true
+							return
+						}
+						
+						isReady := b.cs2Handler != nil && b.cs2Handler.IsReady()
+						b.mutex.Unlock()
+						
+						if currentState == BotStateReady {
+							// Bot is ready, no need for timeout
+							LogInfo("Bot %s: Will reconnect in %v (attempt %d)",
+								b.account.Username, b.reconnectDelay, b.reconnectAttempts)
+							timeoutActive = false
+							continue
+						}
+						
+						// Check if GC is ready
+						LogInfo("Bot %s: GC ready check - isReady: %v, current state: %s",
+							b.account.Username, isReady, currentState)
+						
+						if isReady && currentState != BotStateReady {
+							b.mutex.Lock()
+							// Double-check that client and handler are still valid
+							if b.client == nil || b.cs2Handler == nil {
+								LogWarning("Bot %s: Client or CS2Handler became nil during ready check", b.account.Username)
+								b.state = BotStateDisconnected
+								b.mutex.Unlock()
+								exitEventLoop <- true
+								return
+							}
+							
 							b.state = BotStateReady
 							b.mutex.Unlock()
 							
-							LogInfo("Bot %s: Ready to handle requests (after hello)", b.account.Username)
+							LogInfo("Bot %s: Ready to handle requests", b.account.Username)
+							
+							// Disable the event timeout for ready bots
+							LogInfo("Bot %s: Event timeout disabled for ready bot", b.account.Username)
+							timeoutActive = false
 							
 							// Signal that the bot is ready
 							select {
@@ -831,98 +1135,17 @@ func (b *Bot) connect() bool {
 								// Channel already has a value or is closed
 							}
 							
-							// Disable the event timeout
-							timeoutActive = false
-						}
-					}
-					
-				case <-eventTimeoutTimer.C:
-					// Event timeout occurred
-					b.mutex.Lock()
-					currentState := b.state
-					
-					// Check if client is nil before proceeding
-					if b.client == nil {
-						LogWarning("Bot %s: Client is nil during event timeout", b.account.Username)
-						b.state = BotStateDisconnected
-						b.mutex.Unlock()
-						return false
-					}
-					
-					isReady := b.cs2Handler != nil && b.cs2Handler.IsReady()
-					b.mutex.Unlock()
-					
-					if currentState == BotStateReady {
-						// Bot is ready, no need for timeout
-						LogInfo("Bot %s: Will reconnect in %v (attempt %d)",
-							b.account.Username, b.reconnectDelay, b.reconnectAttempts)
-						timeoutActive = false
-						continue
-					}
-					
-					// Check if GC is ready
-					LogInfo("Bot %s: GC ready check - isReady: %v, current state: %s",
-						b.account.Username, isReady, currentState)
-					
-					if isReady && currentState != BotStateReady {
-						b.mutex.Lock()
-						// Double-check that client and handler are still valid
-						if b.client == nil || b.cs2Handler == nil {
-							LogWarning("Bot %s: Client or CS2Handler became nil during ready check", b.account.Username)
-							b.state = BotStateDisconnected
-							b.mutex.Unlock()
-							return false
+							continue
+						} else if currentState == BotStateLoggedIn {
+							// Bot is logged in but GC is not ready yet, give it more time
+							LogInfo("Bot %s: Resetting event timeout for bot in state: %s",
+								b.account.Username, currentState)
+							eventTimeoutTimer.Reset(30 * time.Second)
+							timeoutActive = true
+							continue
 						}
 						
-						b.state = BotStateReady
-						b.mutex.Unlock()
-						
-						LogInfo("Bot %s: Ready to handle requests", b.account.Username)
-						
-						// Disable the event timeout for ready bots
-						LogInfo("Bot %s: Event timeout disabled for ready bot", b.account.Username)
-						timeoutActive = false
-						
-						// Signal that the bot is ready
-						select {
-						case readySignal <- true:
-							LogInfo("Bot %s: Sent ready signal to main event loop", b.account.Username)
-						default:
-							// Channel already has a value or is closed
-						}
-						
-						continue
-					} else if currentState == BotStateLoggedIn {
-						// Bot is logged in but GC is not ready yet, give it more time
-						LogInfo("Bot %s: Resetting event timeout for bot in state: %s",
-							b.account.Username, currentState)
-						eventTimeoutTimer.Reset(30 * time.Second)
-						timeoutActive = true
-						continue
-					}
-					
-					// If we reach here, we need to reconnect
-					b.mutex.Lock()
-					if b.client != nil {
-						b.client.Disconnect()
-						b.client = nil
-					}
-					if b.cs2Handler != nil {
-						b.cs2Handler.Shutdown()
-						b.cs2Handler = nil
-					}
-					b.state = BotStateDisconnected
-					b.mutex.Unlock()
-					
-					// Break out of the event loop and try reconnecting
-					break
-					
-				case ready := <-readySignal:
-					if ready {
-						LogInfo("Bot %s: Received ready signal, disabling event timeout", b.account.Username)
-						timeoutActive = false
-					} else {
-						// Bot disconnected or failed
+						// If we reach here, we need to reconnect
 						b.mutex.Lock()
 						if b.client != nil {
 							b.client.Disconnect()
@@ -936,28 +1159,84 @@ func (b *Bot) connect() bool {
 						b.mutex.Unlock()
 						
 						// Break out of the event loop and try reconnecting
-						break
+						exitEventLoop <- true
+						return
+						
+					case ready := <-readySignal:
+						if ready {
+							LogInfo("Bot %s: Received ready signal, disabling event timeout", b.account.Username)
+							timeoutActive = false
+						} else {
+							// Bot disconnected or failed
+							b.mutex.Lock()
+							if b.client != nil {
+								b.client.Disconnect()
+								b.client = nil
+							}
+							if b.cs2Handler != nil {
+								b.cs2Handler.Shutdown()
+								b.cs2Handler = nil
+							}
+							b.state = BotStateDisconnected
+							b.mutex.Unlock()
+							
+							// Break out of the event loop and try reconnecting
+							exitEventLoop <- true
+							return
+						}
+						
+					case <-b.ctx.Done():
+						// Bot is shutting down
+						LogInfo("Bot %s: Event timeout occurred but bot is in state %s, disabling timeout",
+							b.account.Username, b.state)
+						
+						b.mutex.Lock()
+						if b.client != nil {
+							b.client.Disconnect()
+							b.client = nil
+						}
+						if b.cs2Handler != nil {
+							b.cs2Handler.Shutdown()
+							b.cs2Handler = nil
+						}
+						b.mutex.Unlock()
+						
+						LogInfo("Bot %s: Shutting down during event processing", b.account.Username)
+						exitEventLoop <- true
+						return
 					}
-					
-				case <-b.ctx.Done():
-					// Bot is shutting down
-					LogInfo("Bot %s: Event timeout occurred but bot is in state %s, disabling timeout",
-						b.account.Username, b.state)
-					
-					b.mutex.Lock()
-					if b.client != nil {
-						b.client.Disconnect()
-						b.client = nil
-					}
-					if b.cs2Handler != nil {
-						b.cs2Handler.Shutdown()
-						b.cs2Handler = nil
-					}
-					b.mutex.Unlock()
-					
-					LogInfo("Bot %s: Shutting down during event processing", b.account.Username)
-					return false
 				}
+			}()
+			
+			// Wait for the event loop to exit or for the bot to become ready
+			select {
+			case <-exitEventLoop:
+				// Event loop exited, bot is disconnected or failed
+				return false
+				
+			case <-readySignal:
+				// Bot is ready
+				LogInfo("Bot %s: Successfully connected and ready", b.account.Username)
+				return true
+				
+			case <-time.After(5 * time.Minute):
+				// Overall timeout for the entire connection process
+				LogWarning("Bot %s: Overall connection process timed out after 5 minutes", b.account.Username)
+				
+				b.mutex.Lock()
+				// Clean up resources
+				if b.client != nil {
+					b.client.Disconnect()
+					b.client = nil
+				}
+				if b.cs2Handler != nil {
+					b.cs2Handler.Shutdown()
+					b.cs2Handler = nil
+				}
+				b.state = BotStateDisconnected
+				b.mutex.Unlock()
+				
+				return false
 			}
 			
 		case <-connectionTimeout:
