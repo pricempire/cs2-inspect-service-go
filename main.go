@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"math/rand"
 	"net/http"
 	"os"
 	"time"
@@ -43,7 +42,7 @@ func main() {
 	// Get port from environment or use default
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "4000"
+		port = "3000"
 	}
 
 	// Initialize database connection
@@ -61,15 +60,18 @@ func main() {
 	StartSchemaUpdater()
 	LogInfo("Schema service initialized")
 
-	// Initialize bots
-	LogInfo("Initializing bot manager...")
-	if err := InitializeBots(); err != nil {
-		LogError("Failed to initialize bots: %v", err)
-		os.Exit(1)
-	}
-	LogInfo("Bot manager initialized successfully")
+	// Initialize bots in background
+	LogInfo("Starting bot manager initialization in background...")
+	go func() {
+		if err := InitializeBots(); err != nil {
+			LogError("Failed to initialize bots: %v", err)
+			// Don't exit the application, just log the error
+		} else {
+			LogInfo("Bot manager initialized successfully")
+		}
+	}()
 	
-	// Register shutdown handler
+	// Register shutdown handler for bots
 	defer ShutdownBots()
 
 	// Start metrics collection
@@ -88,10 +90,22 @@ func main() {
 	http.HandleFunc("/history", handleHistory)
 	
 	// Start HTTP server
-	LogInfo("Starting HTTP server on port %s", port)
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
+	// Listen on all interfaces (0.0.0.0)
+	address := ":" + port
+	LogInfo("Starting HTTP server on %s", address)
+	LogInfo("To access the server, open http://localhost:%s in your browser", port)
+	
+	// Start the server with a simpler approach
+	if err := http.ListenAndServe(address, nil); err != nil {
 		LogError("Failed to start HTTP server: %v", err)
-		os.Exit(1)
+		
+		// If that fails, try localhost only
+		LogInfo("Trying to listen on localhost only...")
+		localAddress := "127.0.0.1:" + port
+		if err := http.ListenAndServe(localAddress, nil); err != nil {
+			LogError("Failed to start HTTP server on localhost: %v", err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -150,142 +164,97 @@ func handleReconnect(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	reconnectedCount := 0
-	failedCount := 0
-	blacklistedCount := 0
-	
-	botManager.mutex.RLock()
-	defer botManager.mutex.RUnlock()
 	
 	// If a username is provided, only reconnect that bot
 	if username != "" {
+		// Check if the account is blacklisted
+		if isBlacklisted(username) {
+			LogWarning("Manual reconnect requested for blacklisted bot: %s", username)
+			sendJSONResponse(w, ReconnectResponse{
+				Success: false,
+				Message: fmt.Sprintf("Bot %s is blacklisted", username),
+			})
+			return
+		}
+		
+		LogInfo("Manual reconnect triggered for bot: %s (force: %v)", username, forceRestart)
+		
+		// Send reconnect command to bot manager thread
+		resultChan := make(chan botResponse, 1)
+		botManager.commandChan <- botCommand{
+			action:      "reconnectBot",
+			botUsername: username,
+			resultChan:  resultChan,
+		}
+		
+		// Wait for response with timeout
+		select {
+		case resp := <-resultChan:
+			if resp.success {
+				reconnectedCount++
+				sendJSONResponse(w, ReconnectResponse{
+					Success: true,
+					Message: resp.message,
+				})
+			} else {
+				sendJSONResponse(w, ReconnectResponse{
+					Success: false,
+					Message: resp.message,
+				})
+			}
+		case <-time.After(5 * time.Second):
+			// Timeout, but reconnect is likely still in progress
+			sendJSONResponse(w, ReconnectResponse{
+				Success: true,
+				Message: fmt.Sprintf("Reconnect for bot %s is in progress", username),
+			})
+		}
+		
+		return
+	} else {
+		// For reconnecting all bots, we'll use a different approach
+		// since we don't want to block the HTTP response
+		
+		// Get a list of all bot usernames
+		var botUsernames []string
+		botManager.mutex.RLock()
 		for _, bot := range botManager.bots {
 			bot.mutex.Lock()
-			if bot.account.Username == username {
-				botUsername := bot.account.Username
-				botState := bot.state
-				bot.mutex.Unlock()
-				
-				// Check if the account is blacklisted
-				if isBlacklisted(botUsername) {
-					LogWarning("Manual reconnect requested for blacklisted bot: %s", botUsername)
-					blacklistedCount++
+			botUsernames = append(botUsernames, bot.account.Username)
+			bot.mutex.Unlock()
+		}
+		botManager.mutex.RUnlock()
+		
+		// Start a goroutine to reconnect all bots
+		go func(usernames []string) {
+			for _, username := range usernames {
+				// Skip blacklisted accounts
+				if isBlacklisted(username) {
+					LogWarning("Skipping reconnect for blacklisted bot: %s", username)
 					continue
 				}
 				
-				LogInfo("Manual reconnect triggered for bot: %s (current state: %s, force: %v)", 
-					botUsername, botState, forceRestart)
-				
-				// If force restart is requested, completely restart the bot
-				if forceRestart {
-					// Use a channel to get the result of the reconnect
-					resultChan := make(chan bool, 1)
-					
-					// Start reconnect in a goroutine to avoid blocking the HTTP response
-					go func(b *Bot, ch chan<- bool) {
-						// First try to gracefully disconnect
-						b.mutex.Lock()
-						if b.cs2Handler != nil {
-							b.cs2Handler.SendGoodbye()
-						}
-						b.mutex.Unlock()
-						
-						// Wait a moment for goodbye to be sent
-						time.Sleep(1 * time.Second)
-						
-						// Then force a complete reconnect
-						success := b.Reconnect()
-						ch <- success
-					}(bot, resultChan)
-					
-					// Wait for the result with a timeout
-					select {
-					case success := <-resultChan:
-						if success {
-							reconnectedCount++
-						} else {
-							failedCount++
-						}
-					case <-time.After(2 * time.Second):
-						// Don't wait for the result, just assume it's in progress
-						LogInfo("Reconnect for bot %s is in progress", botUsername)
-						reconnectedCount++
-					}
-				} else {
-					// Standard reconnect
-					go func(b *Bot) {
-						if b.Reconnect() {
-							LogInfo("Bot %s reconnected successfully", b.account.Username)
-						} else {
-							LogWarning("Bot %s failed to reconnect", b.account.Username)
-						}
-					}(bot)
-					reconnectedCount++
+				// Send reconnect command
+				resultChan := make(chan botResponse, 1)
+				botManager.commandChan <- botCommand{
+					action:      "reconnectBot",
+					botUsername: username,
+					resultChan:  resultChan,
 				}
-				break
-			} else {
-				bot.mutex.Unlock()
+				
+				// Don't wait for response, just fire and forget
+				// The bot manager thread will handle it
+				
+				// Add a small delay between reconnects to avoid overwhelming the system
+				time.Sleep(500 * time.Millisecond)
 			}
-		}
-	} else {
-		// Otherwise, reconnect all bots
-		for _, bot := range botManager.bots {
-			bot.mutex.Lock()
-			botUsername := bot.account.Username
-			botState := bot.state
-			bot.mutex.Unlock()
-			
-			// Check if the account is blacklisted
-			if isBlacklisted(botUsername) {
-				LogWarning("Skipping reconnect for blacklisted bot: %s", botUsername)
-				blacklistedCount++
-				continue
-			}
-			
-			LogInfo("Manual reconnect triggered for bot: %s (current state: %s, force: %v)", 
-				botUsername, botState, forceRestart)
-			
-			// Use a goroutine to avoid blocking the HTTP response
-			go func(b *Bot) {
-				// Add a small delay to avoid all bots reconnecting simultaneously
-				time.Sleep(time.Duration(rand.Intn(3)) * time.Second)
-				
-				if forceRestart {
-					// First try to gracefully disconnect
-					b.mutex.Lock()
-					if b.cs2Handler != nil {
-						b.cs2Handler.SendGoodbye()
-					}
-					b.mutex.Unlock()
-					
-					// Wait a moment for goodbye to be sent
-					time.Sleep(1 * time.Second)
-				}
-				
-				// Then force a complete reconnect
-				if b.Reconnect() {
-					LogInfo("Bot %s reconnected successfully", b.account.Username)
-				} else {
-					LogWarning("Bot %s failed to reconnect", b.account.Username)
-				}
-			}(bot)
-			
-			reconnectedCount++
-		}
+		}(botUsernames)
+		
+		// Return success immediately
+		sendJSONResponse(w, ReconnectResponse{
+			Success: true,
+			Message: fmt.Sprintf("Reconnect initiated for all bots (%d total)", len(botUsernames)),
+		})
+		return
 	}
-	
-	// Prepare response message
-	message := fmt.Sprintf("Reconnect triggered for %d bots", reconnectedCount)
-	if failedCount > 0 {
-		message += fmt.Sprintf(", %d failed", failedCount)
-	}
-	if blacklistedCount > 0 {
-		message += fmt.Sprintf(", %d blacklisted", blacklistedCount)
-	}
-	message += fmt.Sprintf(" (force: %v)", forceRestart)
-	
-	// Send response
-	sendJSONResponse(w, ReconnectResponse{
-		Success: reconnectedCount > 0,
-		Message: message,
-	})
 } 

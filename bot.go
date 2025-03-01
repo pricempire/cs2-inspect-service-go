@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,88 +46,249 @@ type BotManager struct {
 	mutex      sync.RWMutex
 	ctx        context.Context
 	cancelFunc context.CancelFunc
-	maxConcurrentInit int // Maximum number of bots to initialize concurrently
+	
+	// Worker pool for bot operations
+	workerPool     chan struct{}
+	maxConcurrent  int
+	
+	// Communication channels
+	commandChan    chan botCommand
+	responseChan   chan botResponse
+	
+	// Status tracking
+	isInitialized  bool
+	initError      error
+}
+
+// botCommand represents a command sent to the bot manager thread
+type botCommand struct {
+	action      string
+	botUsername string
+	data        interface{}
+	resultChan  chan botResponse
+}
+
+// botResponse represents a response from the bot manager thread
+type botResponse struct {
+	success bool
+	message string
+	data    interface{}
 }
 
 // NewBotManager creates a new bot manager
 func NewBotManager() *BotManager {
 	ctx, cancel := context.WithCancel(context.Background())
 	
-	// Get max concurrent initialization from environment or use default
-	maxConcurrentInit := 100
-	if maxEnv := os.Getenv("MAX_CONCURRENT_INIT"); maxEnv != "" {
-		if val, err := strconv.Atoi(maxEnv); err == nil && val > 0 {
-			maxConcurrentInit = val
-		}
-	}
+	// Determine max concurrent bot operations from env or use default
+	maxConcurrent := 10
 	
 	return &BotManager{
-		bots:       make([]*Bot, 0),
-		ctx:        ctx,
-		cancelFunc: cancel,
-		maxConcurrentInit: maxConcurrentInit,
+		bots:          make([]*Bot, 0),
+		ctx:           ctx,
+		cancelFunc:    cancel,
+		workerPool:    make(chan struct{}, maxConcurrent),
+		maxConcurrent: maxConcurrent,
+		commandChan:   make(chan botCommand, 100),
+		responseChan:  make(chan botResponse, 100),
+		isInitialized: false,
 	}
 }
 
-// Initialize loads accounts and starts bots
+// Initialize loads accounts and starts bots in a completely separate goroutine
 func (bm *BotManager) Initialize() error {
+	// Start the dedicated bot manager thread
+	go bm.botManagerThread()
+	
+	LogInfo("Bot manager thread started")
+	return nil
+}
+
+// botManagerThread is the main thread for bot management
+func (bm *BotManager) botManagerThread() {
+	LogInfo("Starting bot manager thread...")
+	
 	// Load accounts
 	accounts, err := loadAccounts()
 	if err != nil {
-		return err
+		LogError("Failed to load accounts: %v", err)
+		bm.initError = err
+		return
 	}
 	
 	LogInfo("Loaded %d accounts", len(accounts))
 	
-	// Create all bot instances first
+	// Initialize all bots
 	for _, account := range accounts {
 		bot := NewBot(account, bm.ctx)
 		bm.mutex.Lock()
 		bm.bots = append(bm.bots, bot)
 		bm.mutex.Unlock()
-	}
-	
-	// Use a semaphore to limit concurrent initializations
-	semaphore := make(chan struct{}, bm.maxConcurrentInit)
-	var wg sync.WaitGroup
-	
-	LogInfo("Starting bots with maximum %d concurrent initializations", bm.maxConcurrentInit)
-	
-	// Start bots with limited concurrency
-	for _, bot := range bm.bots {
-		wg.Add(1)
+		
+		// Start the bot using the worker pool
 		go func(b *Bot) {
-			defer wg.Done()
-			
-			// Acquire semaphore
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }() // Release semaphore when done
+			// Acquire a worker slot
+			bm.workerPool <- struct{}{}
+			defer func() {
+				// Release the worker slot when done
+				<-bm.workerPool
+			}()
 			
 			// Start the bot
 			b.Start()
 		}(bot)
 	}
 	
-	// Start health monitoring in a separate goroutine
+	LogInfo("All bots have been queued for initialization")
+	
+	// Start health monitoring
 	go bm.monitorBotHealth()
 	
-	// Wait for all bots to finish initialization in a separate goroutine
-	go func() {
-		wg.Wait()
-		LogInfo("All bots have completed initialization")
-	}()
+	// Mark as initialized
+	bm.isInitialized = true
 	
-	return nil
+	// Process commands
+	for {
+		select {
+		case cmd := <-bm.commandChan:
+			// Process command
+			bm.processCommand(cmd)
+			
+		case <-bm.ctx.Done():
+			LogInfo("Bot manager thread shutting down")
+			return
+		}
+	}
+}
+
+// processCommand handles commands sent to the bot manager thread
+func (bm *BotManager) processCommand(cmd botCommand) {
+	switch cmd.action {
+	case "getBot":
+		// Get an available bot
+		bot := bm.getAvailableBotInternal()
+		if bot != nil {
+			cmd.resultChan <- botResponse{
+				success: true,
+				data:    bot,
+			}
+		} else {
+			cmd.resultChan <- botResponse{
+				success: false,
+				message: "No available bot found",
+			}
+		}
+		
+	case "releaseBot":
+		// Release a bot
+		if bot, ok := cmd.data.(*Bot); ok {
+			bm.releaseBotInternal(bot)
+			cmd.resultChan <- botResponse{
+				success: true,
+			}
+		} else {
+			cmd.resultChan <- botResponse{
+				success: false,
+				message: "Invalid bot data",
+			}
+		}
+		
+	case "reconnectBot":
+		// Reconnect a specific bot
+		var targetBot *Bot
+		
+		bm.mutex.RLock()
+		for _, bot := range bm.bots {
+			bot.mutex.Lock()
+			if bot.account.Username == cmd.botUsername {
+				targetBot = bot
+				bot.mutex.Unlock()
+				break
+			}
+			bot.mutex.Unlock()
+		}
+		bm.mutex.RUnlock()
+		
+		if targetBot != nil {
+			// Start reconnect in a worker
+			go func(b *Bot, resChan chan botResponse) {
+				// Acquire a worker slot
+				bm.workerPool <- struct{}{}
+				defer func() {
+					// Release the worker slot when done
+					<-bm.workerPool
+				}()
+				
+				success := b.Reconnect()
+				resChan <- botResponse{
+					success: success,
+					message: fmt.Sprintf("Bot %s reconnect %s", b.account.Username, 
+						map[bool]string{true: "succeeded", false: "failed"}[success]),
+				}
+			}(targetBot, cmd.resultChan)
+		} else {
+			cmd.resultChan <- botResponse{
+				success: false,
+				message: fmt.Sprintf("Bot %s not found", cmd.botUsername),
+			}
+		}
+		
+	default:
+		cmd.resultChan <- botResponse{
+			success: false,
+			message: fmt.Sprintf("Unknown command: %s", cmd.action),
+		}
+	}
 }
 
 // GetAvailableBot returns a bot that is ready to handle requests
 func (bm *BotManager) GetAvailableBot() *Bot {
+	// Send command to bot manager thread
+	resultChan := make(chan botResponse, 1)
+	bm.commandChan <- botCommand{
+		action:     "getBot",
+		resultChan: resultChan,
+	}
+	
+	// Wait for response
+	select {
+	case resp := <-resultChan:
+		if resp.success {
+			return resp.data.(*Bot)
+		}
+		return nil
+	case <-time.After(5 * time.Second):
+		LogWarning("Timeout waiting for available bot")
+		return nil
+	}
+}
+
+// getAvailableBotInternal is the internal implementation of GetAvailableBot
+// that runs in the bot manager thread
+func (bm *BotManager) getAvailableBotInternal() *Bot {
 	bm.mutex.RLock()
 	defer bm.mutex.RUnlock()
 	
 	// First, try to find a bot that is ready and not busy
 	for _, bot := range bm.bots {
 		bot.mutex.Lock()
+		
+		// Double-check that the bot is actually ready by checking GC readiness
+		// if it's been more than 30 seconds since the last check
+		if bot.state == BotStateReady && time.Since(bot.lastGCCheck) > 30*time.Second {
+			if bot.client != nil && bot.cs2Handler != nil {
+				isReady := bot.cs2Handler.IsReady()
+				bot.lastGCCheck = time.Now()
+				
+				// Update state if GC is not ready
+				if !isReady {
+					LogInfo("Bot %s: GC is not ready when getting bot, updating state from %s to %s", 
+						bot.account.Username, bot.state, BotStateLoggedIn)
+					bot.state = BotStateLoggedIn
+				}
+			}
+		}
+		
+		// Now check if the bot is ready
 		if bot.state == BotStateReady {
 			bot.state = BotStateBusy
 			bot.lastUsed = time.Now()
@@ -164,13 +324,53 @@ func (bm *BotManager) GetAvailableBot() *Bot {
 
 // ReleaseBot marks a bot as no longer busy
 func (bm *BotManager) ReleaseBot(bot *Bot) {
+	// Send command to bot manager thread
+	resultChan := make(chan botResponse, 1)
+	bm.commandChan <- botCommand{
+		action:     "releaseBot",
+		data:       bot,
+		resultChan: resultChan,
+	}
+	
+	// Wait for response (with timeout)
+	select {
+	case <-resultChan:
+		// Response received, bot released
+		return
+	case <-time.After(2 * time.Second):
+		// Timeout, log warning but continue
+		LogWarning("Timeout waiting for bot release confirmation")
+		return
+	}
+}
+
+// releaseBotInternal is the internal implementation of ReleaseBot
+// that runs in the bot manager thread
+func (bm *BotManager) releaseBotInternal(bot *Bot) {
 	bot.mutex.Lock()
 	defer bot.mutex.Unlock()
 	
 	if bot.state == BotStateBusy {
-		if bot.isGCReady() {
+		// Check if the bot's GC is ready
+		isReady := false
+		if bot.client != nil && bot.cs2Handler != nil {
+			isReady = bot.cs2Handler.IsReady()
+			bot.lastGCCheck = time.Now()
+			
+			// Log the GC ready state
+			if isReady {
+				LogDebug("Bot %s: GC is ready when releasing", bot.account.Username)
+			} else {
+				LogDebug("Bot %s: GC is not ready when releasing", bot.account.Username)
+			}
+		}
+		
+		// Update the bot state based on GC readiness
+		if isReady {
+			LogDebug("Bot %s: Changing state from %s to %s", bot.account.Username, bot.state, BotStateReady)
 			bot.state = BotStateReady
 		} else {
+			LogDebug("Bot %s: Changing state from %s to %s", bot.account.Username, bot.state, BotStateLoggedIn)
 			bot.state = BotStateLoggedIn
 		}
 	}
@@ -195,10 +395,15 @@ func (bm *BotManager) Shutdown() {
 	}
 	bm.mutex.RUnlock()
 	
+	// Close channels
+	close(bm.commandChan)
+	close(bm.responseChan)
+	
 	LogInfo("Bot manager shutdown complete")
 }
 
 // monitorBotHealth periodically checks all bots and reconnects any that are down
+// This runs in its own goroutine within the bot manager thread
 func (bm *BotManager) monitorBotHealth() {
 	ticker := time.NewTicker(BotHealthCheckInterval)
 	defer ticker.Stop()
@@ -211,6 +416,11 @@ func (bm *BotManager) monitorBotHealth() {
 		case <-ticker.C:
 			bm.mutex.RLock()
 			for _, bot := range bm.bots {
+				// Skip nil bots
+				if bot == nil {
+					continue
+				}
+				
 				bot.mutex.Lock()
 				username := bot.account.Username
 				state := bot.state
@@ -220,9 +430,34 @@ func (bm *BotManager) monitorBotHealth() {
 				needsReconnect := state == BotStateDisconnected
 				
 				// Check if the bot is logged in but GC is not ready
-				needsGCReconnect := (state == BotStateLoggedIn || state == BotStateReady) && 
-					!bot.isGCReady() && 
-					time.Since(bot.lastGCCheck) > GCConnectionTimeout
+				// Only check if the client and cs2Handler are valid
+				needsGCReconnect := false
+				isGCReady := false
+				
+				// Proactively check GC readiness for all logged in bots
+				if bot.client != nil && bot.cs2Handler != nil && 
+					(state == BotStateLoggedIn || state == BotStateReady || state == BotStateBusy) {
+					
+					// Check if we need to update the GC ready status
+					if time.Since(bot.lastGCCheck) > 30*time.Second {
+						isGCReady = bot.cs2Handler.IsReady()
+						bot.lastGCCheck = time.Now()
+						
+						// Update bot state based on GC readiness
+						if isGCReady && state == BotStateLoggedIn {
+							LogInfo("Health monitor: Bot %s GC is ready, updating state from %s to %s", 
+								username, state, BotStateReady)
+							bot.state = BotStateReady
+						} else if !isGCReady && state == BotStateReady {
+							LogInfo("Health monitor: Bot %s GC is not ready, updating state from %s to %s", 
+								username, state, BotStateLoggedIn)
+							bot.state = BotStateLoggedIn
+						}
+						
+						// Check if we need to reconnect to GC
+						needsGCReconnect = !isGCReady && time.Since(bot.lastGCCheck) > GCConnectionTimeout
+					}
+				}
 				
 				bot.mutex.Unlock()
 				
@@ -421,6 +656,17 @@ func (b *Bot) connect() bool {
 			timeoutActive := true
 			
 			for {
+				// Check if client is still valid before proceeding
+				b.mutex.Lock()
+				if b.client == nil {
+					LogWarning("Bot %s: Client is nil, breaking event loop", b.account.Username)
+					b.state = BotStateDisconnected
+					b.mutex.Unlock()
+					break
+				}
+				clientCopy := b.client // Make a copy of the client pointer while under mutex lock
+				b.mutex.Unlock()
+				
 				// If timeout is not active, drain the channel if needed and stop the timer
 				if !timeoutActive && !eventTimeoutTimer.Stop() {
 					select {
@@ -430,7 +676,24 @@ func (b *Bot) connect() bool {
 				}
 				
 				select {
-				case event := <-b.client.Events():
+				case event, ok := <-clientCopy.Events():
+					// Check if channel is closed
+					if !ok {
+						LogWarning("Bot %s: Events channel closed", b.account.Username)
+						b.mutex.Lock()
+						b.state = BotStateDisconnected
+						if b.client != nil {
+							b.client.Disconnect()
+							b.client = nil
+						}
+						if b.cs2Handler != nil {
+							b.cs2Handler.Shutdown()
+							b.cs2Handler = nil
+						}
+						b.mutex.Unlock()
+						return false
+					}
+					
 					switch event.(type) {
 					case *goSteam.ConnectedEvent:
 						LogInfo("Bot %s: Connected to Steam", b.account.Username)
@@ -577,6 +840,16 @@ func (b *Bot) connect() bool {
 					// Event timeout occurred
 					b.mutex.Lock()
 					currentState := b.state
+					
+					// Check if client is nil before proceeding
+					if b.client == nil {
+						LogWarning("Bot %s: Client is nil during event timeout", b.account.Username)
+						b.state = BotStateDisconnected
+						b.mutex.Unlock()
+						return false
+					}
+					
+					isReady := b.cs2Handler != nil && b.cs2Handler.IsReady()
 					b.mutex.Unlock()
 					
 					if currentState == BotStateReady {
@@ -588,16 +861,19 @@ func (b *Bot) connect() bool {
 					}
 					
 					// Check if GC is ready
-					b.mutex.Lock()
-					isReady := b.cs2Handler != nil && b.cs2Handler.IsReady()
-					currentState = b.state
-					b.mutex.Unlock()
-					
 					LogInfo("Bot %s: GC ready check - isReady: %v, current state: %s",
 						b.account.Username, isReady, currentState)
 					
 					if isReady && currentState != BotStateReady {
 						b.mutex.Lock()
+						// Double-check that client and handler are still valid
+						if b.client == nil || b.cs2Handler == nil {
+							LogWarning("Bot %s: Client or CS2Handler became nil during ready check", b.account.Username)
+							b.state = BotStateDisconnected
+							b.mutex.Unlock()
+							return false
+						}
+						
 						b.state = BotStateReady
 						b.mutex.Unlock()
 						
@@ -805,28 +1081,48 @@ func (b *Bot) SendHello() {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 	
+	// Check if client and cs2Handler are valid
+	if b.client == nil {
+		LogWarning("Bot %s: Cannot send hello, client is nil", b.account.Username)
+		return
+	}
+	
+	if b.cs2Handler == nil {
+		LogWarning("Bot %s: Cannot send hello, CS2Handler is nil", b.account.Username)
+		return
+	}
+	
 	if b.state == BotStateLoggedIn || b.state == BotStateReady || b.state == BotStateBusy {
-		if b.cs2Handler != nil {
-			LogInfo("Bot %s: Sending hello to Game Coordinator", b.account.Username)
-			b.cs2Handler.SendHello()
-			b.lastGCCheck = time.Now()
-		}
+		LogInfo("Bot %s: Sending hello to Game Coordinator", b.account.Username)
+		b.cs2Handler.SendHello()
+		b.lastGCCheck = time.Now()
+	} else {
+		LogDebug("Bot %s: Not sending hello, bot state is %s", b.account.Username, b.state)
 	}
 }
 
 // isGCReady checks if the Game Coordinator connection is ready
 func (b *Bot) isGCReady() bool {
 	if b.cs2Handler == nil {
+		LogDebug("Bot %s: CS2Handler is nil, not ready", b.account.Username)
 		return false
 	}
 	
 	ready := b.cs2Handler.IsReady()
 	b.lastGCCheck = time.Now()
 	
+	// Log the ready state for debugging
+	if ready {
+		LogDebug("Bot %s: GC is ready", b.account.Username)
+	} else {
+		LogDebug("Bot %s: GC is not ready", b.account.Username)
+	}
+	
 	// If GC is ready and bot is in logged in state, update to ready state
 	if ready && b.state == BotStateLoggedIn {
+		LogInfo("Bot %s: GC is ready, updating state from %s to %s", 
+			b.account.Username, b.state, BotStateReady)
 		b.state = BotStateReady
-		LogInfo("Bot %s: GC is ready, updating state to ready", b.account.Username)
 	}
 	
 	return ready
@@ -837,9 +1133,18 @@ func (b *Bot) RequestItemInfo(paramA, paramD, paramS, paramM uint64) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 	
-	if b.cs2Handler != nil {
-		b.cs2Handler.RequestItemInfo(paramA, paramD, paramS, paramM)
+	// Check if client and cs2Handler are valid
+	if b.client == nil {
+		LogWarning("Bot %s: Cannot request item info, client is nil", b.account.Username)
+		return
 	}
+	
+	if b.cs2Handler == nil {
+		LogWarning("Bot %s: Cannot request item info, CS2Handler is nil", b.account.Username)
+		return
+	}
+	
+	b.cs2Handler.RequestItemInfo(paramA, paramD, paramS, paramM)
 }
 
 // BlacklistReason represents the reason an account was blacklisted

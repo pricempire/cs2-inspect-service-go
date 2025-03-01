@@ -110,6 +110,17 @@ func (h *CS2Handler) startHelloTicker() {
 func (h *CS2Handler) IsReady() bool {
 	h.readyMutex.RLock()
 	defer h.readyMutex.RUnlock()
+	
+	// Log the current ready state for debugging
+	if time.Since(h.lastStatusCheck) > 10*time.Second {
+		if h.ready {
+			LogDebug("CS2Handler is ready")
+		} else {
+			LogDebug("CS2Handler is not ready")
+		}
+		h.lastStatusCheck = time.Now()
+	}
+	
 	return h.ready
 }
 
@@ -120,10 +131,10 @@ func (h *CS2Handler) SetReady(ready bool) {
 	
 	// If transitioning from not ready to ready, log it
 	if !h.ready && ready {
-		LogInfo("Now ready to process requests")
+		LogInfo("CS2Handler: Now ready to process requests")
 		h.helloAttempts = 0 // Reset hello attempts
 	} else if h.ready && !ready {
-		LogInfo("No longer ready to process requests")
+		LogInfo("CS2Handler: No longer ready to process requests")
 	}
 	
 	h.ready = ready
@@ -140,6 +151,7 @@ func (h *CS2Handler) HandleGCPacket(packet *gamecoordinator.GCPacket) {
 
 	switch packet.MsgType {
 	case uint32(csgoProto.EGCBaseClientMsg_k_EMsgGCClientWelcome):
+		LogInfo("Received welcome message from CS2 Game Coordinator!")
 		h.SetReady(true)
 		LogInfo("Connected to CS2 Game Coordinator!")
 		

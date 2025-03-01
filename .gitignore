@@ -1,6 +1,12 @@
+# account files
 accounts.txt
+blacklist.txt
+
+# env file
 .env
-#go-steam
+
+# go-steam
+go-steam
 
 # schema files cache
 static/schema_*
@@ -13,3 +19,6 @@ sessions/*.json
 
 # logs
 logs/*.log
+
+# inspect-service.log
+inspect-service.log

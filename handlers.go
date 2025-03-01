@@ -38,19 +38,26 @@ func handleInspect(w http.ResponseWriter, r *http.Request) {
 
 	// Get the inspect link from the query string
 	inspectLink := r.URL.Query().Get("link")
-	if inspectLink == "" {
+	inspectUrl := r.URL.Query().Get("url")
+	if inspectUrl == "" && inspectLink == "" {
 		// If no link is provided, serve the HTML documentation page
 		http.ServeFile(w, r, "html/index.html")
 		return
 	}
 
+	// Use inspectUrl as a fallback if inspectLink is empty
+	inspectLinkToUse := inspectLink
+	if inspectLinkToUse == "" {
+		inspectLinkToUse = inspectUrl
+	}
+
 	// Check if we should refresh the data from the Game Coordinator
 	refresh := r.URL.Query().Get("refresh") != ""
 	
-	LogInfo("Received inspect request for link: %s (refresh: %v)", inspectLink, refresh)
+	LogInfo("Received inspect request for link: %s (refresh: %v)", inspectLinkToUse, refresh)
 
 	// Parse the inspect link
-	paramA, paramD, paramS, paramM, err := parseInspectLink(inspectLink)
+	paramA, paramD, paramS, paramM, err := parseInspectLink(inspectLinkToUse)
 	if err != nil {
 		LogError("Invalid inspect link: %v", err)
 		sendJSONResponse(w, InspectResponse{
@@ -678,6 +685,33 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	
 	for _, bot := range botManager.bots {
 		bot.mutex.Lock()
+		
+		// Check GC readiness for logged-in bots
+		isGCReady := false
+		if bot.state == BotStateLoggedIn || bot.state == BotStateReady || bot.state == BotStateBusy {
+			if bot.client != nil && bot.cs2Handler != nil {
+				isGCReady = bot.cs2Handler.IsReady()
+				// Update the last GC check time
+				bot.lastGCCheck = time.Now()
+				
+				// Update bot state based on GC readiness if needed
+				if bot.state == BotStateLoggedIn && isGCReady {
+					LogInfo("Health check: Bot %s GC is ready, updating state from %s to %s", 
+						bot.account.Username, bot.state, BotStateReady)
+					bot.state = BotStateReady
+				} else if (bot.state == BotStateReady || bot.state == BotStateBusy) && !isGCReady {
+					if bot.state == BotStateBusy {
+						LogInfo("Health check: Bot %s GC is not ready but bot is busy, keeping state as %s", 
+							bot.account.Username, bot.state)
+					} else {
+						LogInfo("Health check: Bot %s GC is not ready, updating state from %s to %s", 
+							bot.account.Username, bot.state, BotStateLoggedIn)
+						bot.state = BotStateLoggedIn
+					}
+				}
+			}
+		}
+		
 		status := BotStatus{
 			Username:  bot.account.Username,
 			Connected: bot.state == BotStateConnected || bot.state == BotStateLoggedIn || bot.state == BotStateReady || bot.state == BotStateBusy,
@@ -692,8 +726,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 		// Count bots in each state
 		if status.Busy {
 			busyCount++
-		}
-		if status.Ready {
+		} else if status.Ready {
 			readyCount++
 		}
 		
@@ -705,6 +738,8 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 			initializingCount++
 		case BotStateLoggingIn:
 			initializingCount++
+		case BotStateLoggedIn:
+			// Already counted above
 		}
 	}
 	botManager.mutex.RUnlock()
